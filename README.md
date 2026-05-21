@@ -126,16 +126,26 @@ warnings:
 
 ## Library usage
 
-Add to `Cargo.toml`:
+`strix` is distributed via this repository rather than crates.io.
+Add it to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-strix      = { version = "0.1", features = ["unicorn"] }
+strix      = { git = "https://github.com/marirs/strix", tag = "v0.1.0", features = ["unicorn"] }
 serde_json = "1"
 ```
 
+Use `branch = "master"` instead of `tag` to track the latest unreleased
+changes, or `rev = "<sha>"` to pin a specific commit.
+
 The `unicorn` feature is optional — leave it off if you only need
-static, language, and stack-string extraction.
+static, language, and stack-string extraction. With it off you don't
+need `cmake` or a C toolchain at build time:
+
+```toml
+[dependencies]
+strix = { git = "https://github.com/marirs/strix", tag = "v0.1.0" }
+```
 
 ### Minimal example
 
