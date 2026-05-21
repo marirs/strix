@@ -269,12 +269,7 @@ fn combine(c: &ScoreComponents, w: ScoreWeights) -> f64 {
     // one that calls two imports.
     let s_leaf = leaf_score(c.callee_count + c.import_callee_count);
 
-    let total_w = w.w_bitwise
-        + w.w_loops
-        + w.w_size
-        + w.w_callers
-        + w.w_import_purity
-        + w.w_leaf;
+    let total_w = w.w_bitwise + w.w_loops + w.w_size + w.w_callers + w.w_import_purity + w.w_leaf;
     if total_w == 0.0 {
         return 0.0;
     }

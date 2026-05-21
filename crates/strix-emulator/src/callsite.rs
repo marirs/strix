@@ -392,9 +392,7 @@ pub fn collect_rdata_pointers(
 
     let in_rdata = |va: u64| {
         parsed.sections.iter().any(|s| {
-            !s.executable
-                && va >= s.virtual_address
-                && va < s.virtual_address + s.file_size
+            !s.executable && va >= s.virtual_address && va < s.virtual_address + s.file_size
         })
     };
 

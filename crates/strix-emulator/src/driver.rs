@@ -385,10 +385,7 @@ impl EmulationDriver {
         );
         let heap_range = (layout.heap_base, layout.heap_base + layout.heap_size);
         let stub_range = (layout.stub_base, layout.stub_base + layout.stub_size);
-        let stack_range = (
-            layout.stack_base,
-            layout.stack_base + layout.stack_size,
-        );
+        let stack_range = (layout.stack_base, layout.stack_base + layout.stack_size);
         let overlaps = |va: u64, sz: u64| {
             let end = va.saturating_add(sz);
             let ranges = [scratch_range, heap_range, stub_range, stack_range];
@@ -489,7 +486,8 @@ impl EmulationDriver {
         let bits = self.emu.bits;
         let zero_heap = vec![0u8; self.layout.heap_size as usize];
         let zero_stack = vec![0u8; self.layout.stack_size as usize];
-        self.emu.write_mem(self.layout.scratch_base, scratch_state)?;
+        self.emu
+            .write_mem(self.layout.scratch_base, scratch_state)?;
         self.emu.write_mem(self.layout.heap_base, &zero_heap)?;
         self.emu.write_mem(self.layout.stack_base, &zero_stack)?;
         self.restore_writable_snapshot()?;
@@ -535,12 +533,48 @@ impl EmulationDriver {
             .emu
             .read_mem(self.layout.stack_base, self.layout.stack_size as usize)?;
         let mut recovered = Vec::new();
-        scan_printable_runs(&scratch_after, self.layout.scratch_base, RecoveredKind::Decoded, 4, &mut recovered);
-        scan_printable_runs(&heap_after, self.layout.heap_base, RecoveredKind::Decoded, 4, &mut recovered);
-        scan_printable_runs(&stack_after, self.layout.stack_base, RecoveredKind::Stack, 4, &mut recovered);
-        scan_utf16le_runs(&scratch_after, self.layout.scratch_base, RecoveredKind::Decoded, 4, &mut recovered);
-        scan_utf16le_runs(&heap_after, self.layout.heap_base, RecoveredKind::Decoded, 4, &mut recovered);
-        scan_utf16le_runs(&stack_after, self.layout.stack_base, RecoveredKind::Stack, 4, &mut recovered);
+        scan_printable_runs(
+            &scratch_after,
+            self.layout.scratch_base,
+            RecoveredKind::Decoded,
+            4,
+            &mut recovered,
+        );
+        scan_printable_runs(
+            &heap_after,
+            self.layout.heap_base,
+            RecoveredKind::Decoded,
+            4,
+            &mut recovered,
+        );
+        scan_printable_runs(
+            &stack_after,
+            self.layout.stack_base,
+            RecoveredKind::Stack,
+            4,
+            &mut recovered,
+        );
+        scan_utf16le_runs(
+            &scratch_after,
+            self.layout.scratch_base,
+            RecoveredKind::Decoded,
+            4,
+            &mut recovered,
+        );
+        scan_utf16le_runs(
+            &heap_after,
+            self.layout.heap_base,
+            RecoveredKind::Decoded,
+            4,
+            &mut recovered,
+        );
+        scan_utf16le_runs(
+            &stack_after,
+            self.layout.stack_base,
+            RecoveredKind::Stack,
+            4,
+            &mut recovered,
+        );
         Ok(RunResult {
             recovered,
             execution_ok: execution.is_ok(),

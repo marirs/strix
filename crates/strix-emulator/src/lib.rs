@@ -203,8 +203,8 @@ fn run_emulated_pipeline<'a>(
 
     use crate::analyzer::CodeAnalyzer;
     use crate::callsite::{
-        AbsValPub, collect_rdata_pointers, find_call_sites, make_va_reader,
-        resolve_call_site_regs, resolve_call_site_regs_cross_block,
+        AbsValPub, collect_rdata_pointers, find_call_sites, make_va_reader, resolve_call_site_regs,
+        resolve_call_site_regs_cross_block,
     };
     use crate::driver::{EmulationDriver, RecoveredKind};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
@@ -438,8 +438,7 @@ fn run_emulated_pipeline<'a>(
             const MAX_RDATA_SOURCES_PER_SITE: usize = 4;
             const PREFILL_BYTES: usize = 256;
             if let Some(caller_func) = funcs.get(&site.caller_va) {
-                let sources =
-                    collect_rdata_pointers(&analyzer, caller_func, site, parsed);
+                let sources = collect_rdata_pointers(&analyzer, caller_func, site, parsed);
                 for src_va in sources.iter().take(MAX_RDATA_SOURCES_PER_SITE) {
                     let Some(prefill) = reader(*src_va, PREFILL_BYTES) else {
                         continue;
@@ -469,9 +468,7 @@ fn run_emulated_pipeline<'a>(
                             let prev_decoded = out.decoded.len();
                             let prev_stack = out.stack.len();
                             push_recovered(r, out, &mut driver_errors);
-                            if out.decoded.len() > prev_decoded
-                                || out.stack.len() > prev_stack
-                            {
+                            if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
                                 sites_yielded += 1;
                             }
                         }
