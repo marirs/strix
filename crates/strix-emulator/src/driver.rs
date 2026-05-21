@@ -395,13 +395,11 @@ impl EmulationDriver {
         // (which Unicorn 2.x has deprecated and floods stderr
         // about on every call).
         let state_for_ip_hook = Arc::clone(&state);
-        let _ = emu
-            .uc
-            .add_code_hook(1, u64::MAX, move |_uc, addr, _size| {
-                if let Ok(mut st) = state_for_ip_hook.lock() {
-                    st.current_ip = addr;
-                }
-            });
+        let _ = emu.uc.add_code_hook(1, u64::MAX, move |_uc, addr, _size| {
+            if let Ok(mut st) = state_for_ip_hook.lock() {
+                st.current_ip = addr;
+            }
+        });
 
         // Memory-write tracking hook. Records the IP of every
         // store, indexed by destination byte. Used after emulation

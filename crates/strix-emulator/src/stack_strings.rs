@@ -454,9 +454,7 @@ fn simd_load_from_data(
 
     let va = if insn.is_ip_rel_memory_operand() {
         insn.ip_rel_memory_address()
-    } else if insn.memory_base() == Register::None
-        && insn.memory_index() == Register::None
-    {
+    } else if insn.memory_base() == Register::None && insn.memory_index() == Register::None {
         insn.memory_displacement64()
     } else {
         return None;
