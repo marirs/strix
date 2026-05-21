@@ -40,6 +40,11 @@ pub struct ScoreWeights {
     pub w_size: f64,
     /// Weight for caller-count signal.
     pub w_callers: f64,
+    /// Weight for the "this function doesn't call imports" signal.
+    /// Decoders are pure compute and rarely touch the IAT; functions
+    /// that call several imports are almost certainly something else.
+    /// Applied via [`import_purity_score`], which inverts the count.
+    pub w_import_purity: f64,
 }
 
 impl Default for ScoreWeights {
@@ -47,12 +52,14 @@ impl Default for ScoreWeights {
         // Bitwise density and loop presence are the strongest signals
         // — a function that crunches bytes inside a loop is exactly
         // the shape we're looking for. Size and caller-count are
-        // softer signals.
+        // softer signals. Import-purity is a tie-breaker: it nudges
+        // pure-compute functions above wrapper-style ones.
         Self {
             w_bitwise: 1.5,
             w_loops: 1.2,
             w_size: 0.3,
             w_callers: 0.3,
+            w_import_purity: 0.4,
         }
     }
 }
@@ -70,6 +77,9 @@ pub struct ScoreComponents {
     pub caller_count: u32,
     /// Total number of decoded instructions.
     pub instruction_count: u32,
+    /// Number of distinct imported callees (`call [iat_entry]`
+    /// instructions whose target resolved to a known import).
+    pub import_callee_count: u32,
 }
 
 /// A function's likelihood of being a string decoder.
@@ -183,6 +193,7 @@ fn compute_components(
         byte_size,
         caller_count,
         instruction_count: total_ops,
+        import_callee_count: func.imported_callees.len() as u32,
     }
 }
 
@@ -242,13 +253,33 @@ fn combine(c: &ScoreComponents, w: ScoreWeights) -> f64 {
     let s_loops = loop_score(c.loop_count);
     let s_size = size_score(c.byte_size);
     let s_callers = caller_score(c.caller_count);
+    let s_import_purity = import_purity_score(c.import_callee_count);
 
-    let total_w = w.w_bitwise + w.w_loops + w.w_size + w.w_callers;
+    let total_w =
+        w.w_bitwise + w.w_loops + w.w_size + w.w_callers + w.w_import_purity;
     if total_w == 0.0 {
         return 0.0;
     }
-    (w.w_bitwise * s_bitwise + w.w_loops * s_loops + w.w_size * s_size + w.w_callers * s_callers)
+    (w.w_bitwise * s_bitwise
+        + w.w_loops * s_loops
+        + w.w_size * s_size
+        + w.w_callers * s_callers
+        + w.w_import_purity * s_import_purity)
         / total_w
+}
+
+/// "Doesn't call imports" score — saturates quickly. A function that
+/// touches zero imports gets the full signal; one or two might be
+/// memcpy/strlen-ish helpers a decoder *could* legitimately call, so
+/// the falloff is gentle; above that we drop off fast.
+pub fn import_purity_score(n: u32) -> f64 {
+    match n {
+        0 => 1.0,
+        1 => 0.7,
+        2 => 0.4,
+        3 => 0.15,
+        _ => 0.0,
+    }
 }
 
 /// Saturating loop score: 0 loops -> 0, 1 -> 0.75, 2 -> 0.9, >=3 -> 1.
@@ -296,6 +327,19 @@ fn caller_score(n: u32) -> f64 {
         1 => 0.4,
         2 => 0.7,
         _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod purity_tests {
+    use super::*;
+
+    #[test]
+    fn import_purity_falls_off_quickly() {
+        assert_eq!(import_purity_score(0), 1.0);
+        assert!(import_purity_score(1) > 0.5);
+        assert!(import_purity_score(3) < 0.3);
+        assert_eq!(import_purity_score(10), 0.0);
     }
 }
 

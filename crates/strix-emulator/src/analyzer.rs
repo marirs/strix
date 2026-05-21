@@ -68,6 +68,13 @@ pub struct Function {
     pub blocks: BTreeMap<u64, BasicBlock>,
     /// Direct-call targets observed during analysis.
     pub callees: BTreeSet<u64>,
+    /// Imported functions called via indirect `call [iat_entry]` or
+    /// `call [rip+disp]` where the displacement lands on a known
+    /// IAT entry. Keyed by the IAT entry's virtual address; the
+    /// matching `Import { library, name }` lives in `parsed.imports`.
+    /// Used by the scorer as a negative signal (decoders rarely
+    /// touch imports).
+    pub imported_callees: BTreeSet<u64>,
 }
 
 impl Function {
@@ -245,6 +252,7 @@ impl<'a> CodeAnalyzer<'a> {
         // Block-start VAs we've already finalized.
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
         let mut callees: BTreeSet<u64> = BTreeSet::new();
+        let mut imported_callees: BTreeSet<u64> = BTreeSet::new();
 
         while let Some(block_start) = block_worklist.pop_front() {
             if blocks.contains_key(&block_start) {
@@ -307,7 +315,14 @@ impl<'a> CodeAnalyzer<'a> {
                         break;
                     }
                     FlowControl::IndirectCall => {
-                        // Treat like a call we can't resolve.
+                        // Try to resolve `call [rip+disp]` (PE64) or
+                        // `call [abs]` (PE32) against the known IAT
+                        // entries. When it matches, record the IAT
+                        // VA so the scorer can use "talks to imports"
+                        // as a negative signal for decoder-ness.
+                        if let Some(iat_va) = self.resolve_indirect_call_target(&insn) {
+                            imported_callees.insert(iat_va);
+                        }
                         kind = BlockKind::Call;
                         successors.push(insn.next_ip());
                         block_worklist.push_back(insn.next_ip());
@@ -355,7 +370,45 @@ impl<'a> CodeAnalyzer<'a> {
             entry,
             blocks,
             callees,
+            imported_callees,
         })
+    }
+
+    /// Try to resolve an indirect `call [mem]` instruction to a
+    /// known IAT entry.
+    ///
+    /// PE64 emits `FF 15 disp32` which iced reports as a rip-relative
+    /// memory operand. PE32 uses absolute addressing; iced reports a
+    /// displacement-only operand (base = None, index = None). In both
+    /// cases the effective target VA is compared against
+    /// `parsed.imports[*].iat_va` for a match.
+    fn resolve_indirect_call_target(&self, insn: &Instruction) -> Option<u64> {
+        if insn.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        // The effective address is the memory_displacement64 for both
+        // rip-relative (iced folds rip into the displacement) and
+        // absolute addressing — but only when there's no index
+        // register involved.
+        if insn.memory_index() != iced_x86::Register::None {
+            return None;
+        }
+        let target = if insn.is_ip_rel_memory_operand() {
+            insn.ip_rel_memory_address()
+        } else if insn.memory_base() == iced_x86::Register::None {
+            // Absolute addressing: the displacement IS the address.
+            insn.memory_displacement64()
+        } else {
+            // Register-relative or base-indexed: can't resolve
+            // statically.
+            return None;
+        };
+        // Match against the known import table.
+        if self.parsed.imports.iter().any(|imp| imp.iat_va == target) {
+            Some(target)
+        } else {
+            None
+        }
     }
 }
 
@@ -595,6 +648,67 @@ mod tests {
         assert!(
             funcs.contains_key(&0x5008),
             "missing prologue-discovered function"
+        );
+    }
+
+    #[test]
+    fn indirect_call_resolves_against_iat() {
+        // A single function that does:
+        //   call qword ptr [rip+disp]   ; FF 15 disp32
+        //   ret
+        // The displacement is wired to land on an IAT VA we list in
+        // parsed.imports. The resolved IAT VA should appear in the
+        // function's imported_callees set.
+        // Layout: .text at 0x401000 holds the code; we'll place a
+        // fake IAT entry at 0x402000.
+        const TEXT_VA: u64 = 0x4010_0000;
+        const IAT_VA: u64 = 0x4020_0000;
+        // call instruction is at TEXT_VA, length 6 (FF 15 + 4-byte disp).
+        // next_ip = TEXT_VA + 6 = 0x40100006.
+        // displacement = IAT_VA - next_ip = 0x100_0000 - 6 = 0xFF_FFFA
+        // Hmm wait: IAT_VA - next_ip = 0x4020_0000 - 0x4010_0006 = 0x000F_FFFA
+        let disp: u32 = (IAT_VA - (TEXT_VA + 6)) as u32;
+        let disp_bytes = disp.to_le_bytes();
+        let code: Vec<u8> = vec![
+            0xFF,
+            0x15,
+            disp_bytes[0],
+            disp_bytes[1],
+            disp_bytes[2],
+            disp_bytes[3],
+            0xC3, // ret
+        ];
+        let parsed = ParsedInput {
+            metadata: InputMetadata {
+                format: "pe".into(),
+                arch: Some("x86_64".into()),
+                bits: Some(64),
+                size: code.len() as u64,
+                language: None,
+            },
+            sections: vec![Section {
+                name: ".text".into(),
+                file_offset: 0,
+                file_size: code.len() as u64,
+                virtual_address: TEXT_VA,
+                executable: true,
+                writable: false,
+            }],
+            entry: Some(TEXT_VA),
+            warnings: Vec::new(),
+            scan_window: None,
+            imports: vec![strix_format::Import {
+                library: "kernel32.dll".to_string(),
+                name: "VirtualAlloc".to_string(),
+                iat_va: IAT_VA,
+            }],
+        };
+        let analyzer = CodeAnalyzer::new(&code, &parsed);
+        let f = analyzer.analyze_function(TEXT_VA).expect("function");
+        assert!(
+            f.imported_callees.contains(&IAT_VA),
+            "expected imported_callees to contain {IAT_VA:#x}, got {:#x?}",
+            f.imported_callees
         );
     }
 
