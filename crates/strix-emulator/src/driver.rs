@@ -231,6 +231,13 @@ pub struct EmulationDriver {
     /// closure via `Arc<Mutex<_>>` so the driver can reset it
     /// between runs.
     state: Arc<Mutex<HookState>>,
+    /// Snapshot of writable binary sections (`.data`, `.bss`, etc.)
+    /// taken at driver construction. Restored at the start of every
+    /// `run_function` so that writes from one argument-fuzzing
+    /// variation don't leak into the next. Each entry is a
+    /// `(virtual_address, contents)` pair; contents are zero-padded
+    /// for `.bss`-style sections whose file-size is zero.
+    writable_snapshot: Vec<(u64, Vec<u8>)>,
 }
 
 impl EmulationDriver {
@@ -368,7 +375,177 @@ impl EmulationDriver {
             },
         );
 
-        Ok(Self { emu, layout, state })
+        // Snapshot writable binary sections so we can restore them
+        // between runs. Skip sections that overlap our pre-mapped
+        // regions (scratch / heap / stub / stack) — those have
+        // dedicated reset paths.
+        let scratch_range = (
+            layout.scratch_base,
+            layout.scratch_base + layout.scratch_size,
+        );
+        let heap_range = (layout.heap_base, layout.heap_base + layout.heap_size);
+        let stub_range = (layout.stub_base, layout.stub_base + layout.stub_size);
+        let stack_range = (
+            layout.stack_base,
+            layout.stack_base + layout.stack_size,
+        );
+        let overlaps = |va: u64, sz: u64| {
+            let end = va.saturating_add(sz);
+            let ranges = [scratch_range, heap_range, stub_range, stack_range];
+            ranges.iter().any(|(lo, hi)| va < *hi && end > *lo)
+        };
+        let mut writable_snapshot: Vec<(u64, Vec<u8>)> = Vec::new();
+        for sec in &parsed.sections {
+            if !sec.writable || sec.file_size == 0 {
+                continue;
+            }
+            if overlaps(sec.virtual_address, sec.file_size) {
+                continue;
+            }
+            // Read the section's CURRENT contents from the emulator
+            // (which CpuEmulator::from_parsed already wrote in from
+            // the input bytes). This captures `.data`'s initialized
+            // contents while still letting `.bss`-style sections
+            // (file_size == 0) be re-zeroed by skipping them.
+            match emu.read_mem(sec.virtual_address, sec.file_size as usize) {
+                Ok(bytes) => writable_snapshot.push((sec.virtual_address, bytes)),
+                Err(_) => {
+                    // Section wasn't mapped into the emulator for
+                    // some reason — skip without failing driver
+                    // construction.
+                }
+            }
+        }
+
+        Ok(Self {
+            emu,
+            layout,
+            state,
+            writable_snapshot,
+        })
+    }
+
+    /// Restore each snapshotted writable section to its original
+    /// (initialized) contents. Cheap when the binary has no
+    /// writable sections — the snapshot vector is just empty.
+    fn restore_writable_snapshot(&mut self) -> Result<()> {
+        // Clone the borrowed metadata up front so we can release
+        // the borrow before calling write_mem (which borrows &mut self).
+        // The snapshot is small in practice — typically a handful of
+        // sections; the .clone() cost is dominated by emu mem_write.
+        let entries: Vec<(u64, Vec<u8>)> = self.writable_snapshot.clone();
+        for (va, bytes) in &entries {
+            self.emu.write_mem(*va, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Run `entry` with the given args after pre-populating the
+    /// start of the scratch buffer with `prefill`. Useful for
+    /// in-place decoders that read encoded bytes from a buffer the
+    /// caller materialized — we copy those bytes into scratch so
+    /// the decoder reads real data instead of zeros.
+    ///
+    /// To avoid emitting the prefill itself as a "decoded" string,
+    /// any recovered run whose bytes match the corresponding range
+    /// in the prefill is filtered out — only bytes that actually
+    /// changed during emulation survive.
+    pub fn run_function_with_prefill(
+        &mut self,
+        entry: u64,
+        max_steps: u64,
+        args: &ArgSet,
+        prefill: &[u8],
+    ) -> Result<RunResult> {
+        let scratch_size = self.layout.scratch_size as usize;
+        let prefill_len = prefill.len().min(scratch_size);
+        let mut before = vec![0u8; scratch_size];
+        before[..prefill_len].copy_from_slice(&prefill[..prefill_len]);
+
+        let mut res = self.run_with_scratch_state(entry, max_steps, args, &before)?;
+        let scratch_base = self.layout.scratch_base;
+        let scratch_end = scratch_base + scratch_size as u64;
+        res.recovered.retain(|s| {
+            if s.address < scratch_base || s.address >= scratch_end {
+                return true;
+            }
+            let off = (s.address - scratch_base) as usize;
+            let take = s.value.len().min(before.len().saturating_sub(off));
+            s.value.as_bytes() != &before[off..off + take]
+        });
+        Ok(res)
+    }
+
+    /// Run `entry` once with the given args, but install
+    /// `scratch_state` as the initial scratch contents instead of
+    /// the usual zero fill. Heap and stack are still zeroed.
+    fn run_with_scratch_state(
+        &mut self,
+        entry: u64,
+        max_steps: u64,
+        args: &ArgSet,
+        scratch_state: &[u8],
+    ) -> Result<RunResult> {
+        let bits = self.emu.bits;
+        let zero_heap = vec![0u8; self.layout.heap_size as usize];
+        let zero_stack = vec![0u8; self.layout.stack_size as usize];
+        self.emu.write_mem(self.layout.scratch_base, scratch_state)?;
+        self.emu.write_mem(self.layout.heap_base, &zero_heap)?;
+        self.emu.write_mem(self.layout.stack_base, &zero_stack)?;
+        self.restore_writable_snapshot()?;
+        if let Ok(mut st) = self.state.lock() {
+            st.heap_ptr = st.heap_base;
+        }
+        let ptr_size: u64 = if bits == 64 { 8 } else { 4 };
+        let stack_top = self.layout.stack_base + self.layout.stack_size - 0x100;
+        let rsp = stack_top - ptr_size;
+        if bits == 64 {
+            self.emu
+                .write_mem(rsp, &self.layout.magic_return.to_le_bytes())?;
+            self.emu.write_reg(RegisterX86::RSP, rsp)?;
+            self.emu.write_reg(RegisterX86::RBP, rsp)?;
+            self.emu.write_reg(RegisterX86::RDI, args.rdi)?;
+            self.emu.write_reg(RegisterX86::RSI, args.rsi)?;
+            self.emu.write_reg(RegisterX86::RDX, args.rdx)?;
+            self.emu.write_reg(RegisterX86::RCX, args.rcx)?;
+            self.emu.write_reg(RegisterX86::R8, args.r8)?;
+            self.emu.write_reg(RegisterX86::R9, args.r9)?;
+        } else {
+            let m32 = self.layout.magic_return as u32;
+            self.emu.write_mem(rsp, &m32.to_le_bytes())?;
+            self.emu.write_reg(RegisterX86::ESP, rsp)?;
+            self.emu.write_reg(RegisterX86::EBP, rsp)?;
+            let arg1_pos = rsp - 8;
+            let arg2_pos = rsp - 4;
+            self.emu
+                .write_mem(arg1_pos, &(args.rdi as u32).to_le_bytes())?;
+            self.emu
+                .write_mem(arg2_pos, &(args.rsi as u32).to_le_bytes())?;
+        }
+        let execution = self
+            .emu
+            .run_until(entry, self.layout.magic_return, 0, max_steps);
+        let scratch_after = self
+            .emu
+            .read_mem(self.layout.scratch_base, self.layout.scratch_size as usize)?;
+        let heap_after = self
+            .emu
+            .read_mem(self.layout.heap_base, self.layout.heap_size as usize)?;
+        let stack_after = self
+            .emu
+            .read_mem(self.layout.stack_base, self.layout.stack_size as usize)?;
+        let mut recovered = Vec::new();
+        scan_printable_runs(&scratch_after, self.layout.scratch_base, RecoveredKind::Decoded, 4, &mut recovered);
+        scan_printable_runs(&heap_after, self.layout.heap_base, RecoveredKind::Decoded, 4, &mut recovered);
+        scan_printable_runs(&stack_after, self.layout.stack_base, RecoveredKind::Stack, 4, &mut recovered);
+        scan_utf16le_runs(&scratch_after, self.layout.scratch_base, RecoveredKind::Decoded, 4, &mut recovered);
+        scan_utf16le_runs(&heap_after, self.layout.heap_base, RecoveredKind::Decoded, 4, &mut recovered);
+        scan_utf16le_runs(&stack_after, self.layout.stack_base, RecoveredKind::Stack, 4, &mut recovered);
+        Ok(RunResult {
+            recovered,
+            execution_ok: execution.is_ok(),
+            error: execution.err().map(|e| e.to_string()),
+        })
     }
 
     /// Run `entry` once with the given `args`, returning the printable
@@ -385,6 +562,10 @@ impl EmulationDriver {
             .write_mem(self.layout.scratch_base, &zero_scratch)?;
         self.emu.write_mem(self.layout.heap_base, &zero_heap)?;
         self.emu.write_mem(self.layout.stack_base, &zero_stack)?;
+        // Restore writable-section snapshot so per-run side effects
+        // on `.data` / `.bss` don't leak across argument-fuzzing
+        // variations.
+        self.restore_writable_snapshot()?;
         // Reset heap allocator pointer.
         if let Ok(mut st) = self.state.lock() {
             st.heap_ptr = st.heap_base;

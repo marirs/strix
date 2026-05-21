@@ -203,8 +203,8 @@ fn run_emulated_pipeline<'a>(
 
     use crate::analyzer::CodeAnalyzer;
     use crate::callsite::{
-        AbsValPub, find_call_sites, make_va_reader, resolve_call_site_regs,
-        resolve_call_site_regs_cross_block,
+        AbsValPub, collect_rdata_pointers, find_call_sites, make_va_reader,
+        resolve_call_site_regs, resolve_call_site_regs_cross_block,
     };
     use crate::driver::{EmulationDriver, RecoveredKind};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
@@ -425,6 +425,59 @@ fn run_emulated_pipeline<'a>(
                     }
                 }
                 Err(_) => driver_errors += 1,
+            }
+
+            // Additional pass: pre-populate scratch with bytes from
+            // each .rdata pointer visible near this call site, then
+            // run the decoder pointing rcx at scratch. Catches the
+            // common in-place pattern where the caller stages
+            // encoded bytes into a local buffer (often via inline
+            // mov-chains rather than a memcpy call) before invoking
+            // the decoder. We try up to 4 distinct sources per call
+            // site to bound wall-clock.
+            const MAX_RDATA_SOURCES_PER_SITE: usize = 4;
+            const PREFILL_BYTES: usize = 256;
+            if let Some(caller_func) = funcs.get(&site.caller_va) {
+                let sources =
+                    collect_rdata_pointers(&analyzer, caller_func, site, parsed);
+                for src_va in sources.iter().take(MAX_RDATA_SOURCES_PER_SITE) {
+                    let Some(prefill) = reader(*src_va, PREFILL_BYTES) else {
+                        continue;
+                    };
+                    let mut prefill_args = arg_set;
+                    // Re-point any in-rdata pointer arg at scratch
+                    // since the decoder reads from there now.
+                    if matches!(regs.rcx, AbsValPub::Pointer(_)) {
+                        prefill_args.rcx = driver.layout.scratch_base;
+                    }
+                    if matches!(regs.rdx, AbsValPub::Pointer(_)) {
+                        prefill_args.rdx = driver.layout.scratch_base;
+                    }
+                    if matches!(regs.rsi, AbsValPub::Pointer(_)) {
+                        prefill_args.rsi = driver.layout.scratch_base;
+                    }
+                    if matches!(regs.rdi, AbsValPub::Pointer(_)) {
+                        prefill_args.rdi = driver.layout.scratch_base;
+                    }
+                    match driver.run_function_with_prefill(
+                        *callee,
+                        callsite_step_cap,
+                        &prefill_args,
+                        &prefill,
+                    ) {
+                        Ok(r) => {
+                            let prev_decoded = out.decoded.len();
+                            let prev_stack = out.stack.len();
+                            push_recovered(r, out, &mut driver_errors);
+                            if out.decoded.len() > prev_decoded
+                                || out.stack.len() > prev_stack
+                            {
+                                sites_yielded += 1;
+                            }
+                        }
+                        Err(_) => driver_errors += 1,
+                    }
+                }
             }
         }
     }

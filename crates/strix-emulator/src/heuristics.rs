@@ -45,6 +45,11 @@ pub struct ScoreWeights {
     /// that call several imports are almost certainly something else.
     /// Applied via [`import_purity_score`], which inverts the count.
     pub w_import_purity: f64,
+    /// Weight for the "leaf-shaped" signal: functions with few or
+    /// no callees of any kind (direct or via IAT) look more like
+    /// decoders. A pure-leaf function gets the full signal; each
+    /// additional callee drives it down. See [`leaf_score`].
+    pub w_leaf: f64,
 }
 
 impl Default for ScoreWeights {
@@ -60,6 +65,7 @@ impl Default for ScoreWeights {
             w_size: 0.3,
             w_callers: 0.3,
             w_import_purity: 0.4,
+            w_leaf: 0.3,
         }
     }
 }
@@ -80,6 +86,9 @@ pub struct ScoreComponents {
     /// Number of distinct imported callees (`call [iat_entry]`
     /// instructions whose target resolved to a known import).
     pub import_callee_count: u32,
+    /// Number of distinct direct-call callees. Used together with
+    /// `import_callee_count` to compute the leaf-shape signal.
+    pub callee_count: u32,
 }
 
 /// A function's likelihood of being a string decoder.
@@ -194,6 +203,7 @@ fn compute_components(
         caller_count,
         instruction_count: total_ops,
         import_callee_count: func.imported_callees.len() as u32,
+        callee_count: func.callees.len() as u32,
     }
 }
 
@@ -254,8 +264,17 @@ fn combine(c: &ScoreComponents, w: ScoreWeights) -> f64 {
     let s_size = size_score(c.byte_size);
     let s_callers = caller_score(c.caller_count);
     let s_import_purity = import_purity_score(c.import_callee_count);
+    // Combine direct + import callees for the leaf signal — a
+    // function that calls two helpers is just as un-leaf-like as
+    // one that calls two imports.
+    let s_leaf = leaf_score(c.callee_count + c.import_callee_count);
 
-    let total_w = w.w_bitwise + w.w_loops + w.w_size + w.w_callers + w.w_import_purity;
+    let total_w = w.w_bitwise
+        + w.w_loops
+        + w.w_size
+        + w.w_callers
+        + w.w_import_purity
+        + w.w_leaf;
     if total_w == 0.0 {
         return 0.0;
     }
@@ -263,8 +282,23 @@ fn combine(c: &ScoreComponents, w: ScoreWeights) -> f64 {
         + w.w_loops * s_loops
         + w.w_size * s_size
         + w.w_callers * s_callers
-        + w.w_import_purity * s_import_purity)
+        + w.w_import_purity * s_import_purity
+        + w.w_leaf * s_leaf)
         / total_w
+}
+
+/// Leaf-shape score: a function that calls nothing else looks the
+/// most decoder-like. Each callee drops the score; by the time a
+/// function calls four or more other things, it's almost
+/// certainly orchestrator logic rather than the decoder itself.
+pub fn leaf_score(total_callees: u32) -> f64 {
+    match total_callees {
+        0 => 1.0,
+        1 => 0.7,
+        2 => 0.4,
+        3 => 0.2,
+        _ => 0.0,
+    }
 }
 
 /// "Doesn't call imports" score — saturates quickly. A function that
@@ -294,20 +328,30 @@ fn loop_score(n: u32) -> f64 {
     }
 }
 
-/// Goldilocks curve for function size: peaks around 256 bytes, falls
-/// off at both extremes. Tight inner loops (~16 bytes) get a decent
-/// score because they're a valid decoder shape; huge functions (>8KB)
-/// go to zero because real decoders are rarely that large.
+/// Goldilocks curve for function size: peaks around 256 bytes,
+/// falls off at both extremes. Tight inner-loop decoders (~12 bytes
+/// — a 1-byte-XOR / ROL / ADD loop) score competitively because
+/// they're a real decoder shape; huge functions (> 8KB) go to zero
+/// because real decoders are rarely that large.
+///
+/// The curve was lifted at the small end after observing real
+/// fixtures (single-byte-XOR variants, tight base64 inner loops)
+/// scoring just below the candidate threshold under the previous
+/// `b/16 * 0.5` ramp that capped tiny functions at 0.5.
 fn size_score(bytes: u64) -> f64 {
     let b = bytes as f64;
-    if b == 0.0 {
+    if b < 8.0 {
+        // Sub-three-instruction. Not a function we care about.
         return 0.0;
     }
     if b < 16.0 {
-        return b / 16.0 * 0.5;
+        // 8..16 bytes ramps from 0.4 to 0.6 — small decoders get
+        // a credible base score rather than being capped at 0.5.
+        return 0.4 + (b - 8.0) / 8.0 * 0.2;
     }
     if b < 256.0 {
-        return 0.5 + 0.5 * ((b - 16.0) / (256.0 - 16.0));
+        // 16..256 bytes ramps from 0.6 to 1.0.
+        return 0.6 + 0.4 * ((b - 16.0) / (256.0 - 16.0));
     }
     if b < 2048.0 {
         return 1.0 - 0.5 * ((b - 256.0) / (2048.0 - 256.0));
@@ -339,6 +383,15 @@ mod purity_tests {
         assert!(import_purity_score(1) > 0.5);
         assert!(import_purity_score(3) < 0.3);
         assert_eq!(import_purity_score(10), 0.0);
+    }
+
+    #[test]
+    fn leaf_score_rewards_pure_leaves() {
+        assert_eq!(leaf_score(0), 1.0);
+        assert!(leaf_score(1) > 0.5);
+        assert!(leaf_score(2) < 0.5);
+        assert!(leaf_score(3) < 0.3);
+        assert_eq!(leaf_score(8), 0.0);
     }
 }
 

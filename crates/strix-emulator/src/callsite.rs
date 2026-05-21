@@ -374,6 +374,80 @@ fn merge_states(states: &[RegState]) -> RegState {
     out
 }
 
+/// Collect unique rip-relative `lea reg, [rip+disp]` targets from
+/// the basic block containing `site.call_ip` plus any single
+/// immediate predecessor block. These VAs are typical candidates
+/// for "encoded data in .rdata" that the caller is about to pass
+/// (directly, or via a memcpy/inline init) to the decoder.
+///
+/// Each entry has the resolved VA and a guard that the address
+/// lies in a non-executable section (real rdata, not code).
+pub fn collect_rdata_pointers(
+    analyzer: &CodeAnalyzer<'_>,
+    func: &Function,
+    site: CallSite,
+    parsed: &ParsedInput,
+) -> Vec<u64> {
+    let mut out: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+
+    let in_rdata = |va: u64| {
+        parsed.sections.iter().any(|s| {
+            !s.executable
+                && va >= s.virtual_address
+                && va < s.virtual_address + s.file_size
+        })
+    };
+
+    // Walk the call block.
+    scan_block_for_rdata_leas(
+        analyzer,
+        site.block_start,
+        site.next_ip,
+        &in_rdata,
+        &mut out,
+    );
+
+    // Walk single-predecessor block(s).
+    for block in func.blocks.values() {
+        if block.start == site.block_start {
+            continue;
+        }
+        if !block.successors.contains(&site.block_start) {
+            continue;
+        }
+        scan_block_for_rdata_leas(analyzer, block.start, block.end, &in_rdata, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+fn scan_block_for_rdata_leas(
+    analyzer: &CodeAnalyzer<'_>,
+    start: u64,
+    end: u64,
+    in_rdata: &impl Fn(u64) -> bool,
+    out: &mut std::collections::BTreeSet<u64>,
+) {
+    let Some(block_bytes) = analyzer.bytes_at_va(start) else {
+        return;
+    };
+    let len = end.saturating_sub(start) as usize;
+    let len = len.min(block_bytes.len());
+    let dec_bytes = &block_bytes[..len];
+    let decoder = Decoder::with_ip(analyzer.bitness(), dec_bytes, start, DecoderOptions::NONE);
+    for insn in decoder {
+        if insn.mnemonic() != Mnemonic::Lea {
+            continue;
+        }
+        if !insn.is_ip_rel_memory_operand() {
+            continue;
+        }
+        let va = insn.ip_rel_memory_address();
+        if in_rdata(va) {
+            out.insert(va);
+        }
+    }
+}
+
 /// Build a `bytes_for_va` callback over a `ParsedInput` and its raw
 /// bytes. Honors section bounds; returns None for VAs outside any
 /// mapped section.
