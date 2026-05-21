@@ -499,12 +499,12 @@ impl EmulationDriver {
             }
             let mut ips: Vec<u64> = Vec::new();
             for off in 0..len as u64 {
-                if let Some(ip) = st.mem_writes.get(&(rec.address + off)) {
-                    if !ips.contains(ip) {
-                        ips.push(*ip);
-                        if ips.len() >= 8 {
-                            break;
-                        }
+                if let Some(ip) = st.mem_writes.get(&(rec.address + off))
+                    && !ips.contains(ip)
+                {
+                    ips.push(*ip);
+                    if ips.len() >= 8 {
+                        break;
                     }
                 }
             }

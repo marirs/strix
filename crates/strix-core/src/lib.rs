@@ -13,11 +13,13 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+pub mod capability;
 pub mod error;
 pub mod library;
 pub mod quality;
 pub mod traits;
 
+pub use capability::tags_for_imports;
 pub use error::{Error, Result};
 pub use library::is_library_string;
 pub use quality::string_quality;
@@ -87,6 +89,22 @@ pub struct Location {
     /// Section name, if known (e.g., `.rdata`, `.text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// Virtual address of the function that produced this string,
+    /// when known. Set for emulation-recovered strings (decoded /
+    /// stack / tight) — pattern-based stack strings carry the
+    /// function they were built in, and emulated writes get
+    /// attributed to whichever function contains the writing
+    /// instruction. `None` for static / language strings since
+    /// those don't have a producing function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_va: Option<u64>,
+    /// Virtual address of the encoded source bytes that fed a
+    /// prefill-driven decoder run. Only set on decoded strings
+    /// that were recovered from the rdata-prefill path; lets
+    /// analysts trace each decoded string back to the exact
+    /// `.rdata` blob it came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_va: Option<u64>,
 }
 
 impl Location {
@@ -96,6 +114,8 @@ impl Location {
             offset,
             address: None,
             section: None,
+            function_va: None,
+            source_va: None,
         }
     }
 }
@@ -273,6 +293,15 @@ pub struct DecoderCandidate {
     /// function. Strings are attributed by their `location.address`,
     /// which the emulator sets to the function VA.
     pub recovered_strings: u32,
+    /// Capability tags derived from the function's imported
+    /// callees. Each tag is a coarse category — `calls_alloc`,
+    /// `calls_memcpy`, `calls_network`, `calls_filesystem`,
+    /// `calls_registry`, `calls_process`, `calls_crypto`,
+    /// `calls_loader`, `calls_debug` — so analysts can spot
+    /// allocator-using decoders or wrapper-style functions at a
+    /// glance. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Top-level result of an extraction.

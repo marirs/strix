@@ -182,6 +182,8 @@ pub(crate) fn extract_utf8_runs<'a>(
                     offset,
                     address: section.offset_to_va(offset),
                     section: Some(section.name.clone()),
+                    function_va: None,
+                    source_va: None,
                 },
             });
             i = run_end;

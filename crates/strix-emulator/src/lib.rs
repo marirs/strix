@@ -131,6 +131,8 @@ pub fn extract_emulated<'a>(
                     offset: 0,
                     address: Some(rec.function_va),
                     section: Some(section_tag.to_string()),
+                    function_va: Some(rec.function_va),
+                    source_va: None,
                 },
             });
         }
@@ -265,8 +267,23 @@ fn run_emulated_pipeline<'a>(
         false
     };
 
+    // Map a writing IP to the VA of the function that contains it,
+    // if any. Used to tag recovered strings with their producing
+    // function VA so analysts can group output by function.
+    let ip_to_func = |ip: u64| -> Option<u64> {
+        for (func_va, func) in &funcs {
+            for (start, block) in &func.blocks {
+                if ip >= *start && ip < block.end {
+                    return Some(*func_va);
+                }
+            }
+        }
+        None
+    };
+
     let push_recovered = |run: crate::driver::RunResult,
-                          _func_va: u64,
+                          fallback_func_va: u64,
+                          source_va: Option<u64>,
                           out: &mut EmulationResults<'a>,
                           driver_errors: &mut u32| {
         if !run.execution_ok {
@@ -281,6 +298,14 @@ fn run_emulated_pipeline<'a>(
             // anywhere in the binary.
             let is_tight = matches!(rec.kind, RecoveredKind::Stack)
                 && rec.writing_ips.iter().any(|ip| ip_in_loop(*ip));
+            // Attribute the string to whichever function contains
+            // the first known writing IP; fall back to the
+            // candidate we were running when we ran out of IPs.
+            let function_va = rec
+                .writing_ips
+                .iter()
+                .find_map(|ip| ip_to_func(*ip))
+                .or(Some(fallback_func_va));
             let (final_kind, section_tag) = match rec.kind {
                 RecoveredKind::Decoded => (StringKind::Decoded, "scratch"),
                 RecoveredKind::Stack if is_tight => (StringKind::Tight, "stack-tight"),
@@ -294,6 +319,8 @@ fn run_emulated_pipeline<'a>(
                     offset: 0,
                     address: Some(rec.address),
                     section: Some(section_tag.to_string()),
+                    function_va,
+                    source_va,
                 },
             };
             match final_kind {
@@ -314,7 +341,7 @@ fn run_emulated_pipeline<'a>(
     for entry in &candidate_vas {
         attempts += 1;
         match driver.run_function_fuzzed(*entry, options.max_emulation_steps) {
-            Ok(r) => push_recovered(r, *entry, out, &mut driver_errors),
+            Ok(r) => push_recovered(r, *entry, None, out, &mut driver_errors),
             Err(_) => driver_errors += 1,
         }
     }
@@ -346,7 +373,7 @@ fn run_emulated_pipeline<'a>(
         for caller in callers {
             callers_attempted += 1;
             match driver.run_function_fuzzed(caller, caller_step_cap) {
-                Ok(r) => push_recovered(r, caller, out, &mut callers_errors),
+                Ok(r) => push_recovered(r, caller, None, out, &mut callers_errors),
                 Err(_) => callers_errors += 1,
             }
         }
@@ -453,7 +480,7 @@ fn run_emulated_pipeline<'a>(
                 Ok(r) => {
                     let prev_decoded = out.decoded.len();
                     let prev_stack = out.stack.len();
-                    push_recovered(r, *callee, out, &mut driver_errors);
+                    push_recovered(r, *callee, None, out, &mut driver_errors);
                     if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
                         sites_yielded += 1;
                     }
@@ -501,7 +528,7 @@ fn run_emulated_pipeline<'a>(
                         Ok(r) => {
                             let prev_decoded = out.decoded.len();
                             let prev_stack = out.stack.len();
-                            push_recovered(r, *callee, out, &mut driver_errors);
+                            push_recovered(r, *callee, Some(*src_va), out, &mut driver_errors);
                             if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
                                 sites_yielded += 1;
                             }
@@ -547,16 +574,39 @@ fn run_emulated_pipeline<'a>(
     }
     out.candidates = candidates
         .iter()
-        .map(|(va, score)| DecoderCandidate {
-            va: *va,
-            score: score.score,
-            bitwise_density: score.components.bitwise_density,
-            loop_count: score.components.loop_count,
-            byte_size: score.components.byte_size,
-            caller_count: score.components.caller_count,
-            instruction_count: score.components.instruction_count,
-            import_callee_count: score.components.import_callee_count,
-            recovered_strings: counts_by_va.get(va).copied().unwrap_or(0),
+        .map(|(va, score)| {
+            // Build capability tags from the function's resolved
+            // imported callees. Look each iat_va back up in
+            // parsed.imports to get the name, then run the lot
+            // through the capability classifier.
+            let tags = if let Some(func) = funcs.get(va) {
+                let names: Vec<&str> = func
+                    .imported_callees
+                    .iter()
+                    .filter_map(|iat| {
+                        parsed
+                            .imports
+                            .iter()
+                            .find(|imp| imp.iat_va == *iat)
+                            .map(|imp| imp.name.as_str())
+                    })
+                    .collect();
+                strix_core::tags_for_imports(names)
+            } else {
+                Vec::new()
+            };
+            DecoderCandidate {
+                va: *va,
+                score: score.score,
+                bitwise_density: score.components.bitwise_density,
+                loop_count: score.components.loop_count,
+                byte_size: score.components.byte_size,
+                caller_count: score.components.caller_count,
+                instruction_count: score.components.instruction_count,
+                import_callee_count: score.components.import_callee_count,
+                recovered_strings: counts_by_va.get(va).copied().unwrap_or(0),
+                tags,
+            }
         })
         .collect();
 
