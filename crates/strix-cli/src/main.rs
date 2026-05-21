@@ -137,6 +137,13 @@ struct Cli {
     /// (no filter).
     #[arg(long, default_value_t = 0.0)]
     min_quality: f64,
+
+    /// In human-readable mode, group emulation-recovered strings
+    /// (decoded / stack / tight) by their source function VA.
+    /// Each function gets a subheading inside its section. Useful
+    /// for tracking which decoder routine produced which strings.
+    #[arg(long)]
+    by_function: bool,
 }
 
 fn main() -> Result<()> {
@@ -210,7 +217,7 @@ fn main() -> Result<()> {
         }
         writeln!(out)?;
     } else {
-        print_human(&result, &mut out, cli.quiet)?;
+        print_human(&result, &mut out, cli.quiet, cli.by_function)?;
     }
     out.flush()?;
     Ok(())
@@ -221,7 +228,14 @@ fn main() -> Result<()> {
 /// Sections appear in a fixed order — static, language, decoded,
 /// stack, tight — with empty sections skipped. Within a section,
 /// strings are sorted by address (if known) else by file offset.
-fn print_human(result: &ExtractionResult<'_>, out: &mut dyn Write, quiet: bool) -> io::Result<()> {
+/// When `by_function` is true, emulation-recovered sections
+/// (decoded / stack / tight) are sub-grouped by source function VA.
+fn print_human(
+    result: &ExtractionResult<'_>,
+    out: &mut dyn Write,
+    quiet: bool,
+    by_function: bool,
+) -> io::Result<()> {
     let groups = group_strings(&result.strings);
     let order = [
         (
@@ -254,6 +268,13 @@ fn print_human(result: &ExtractionResult<'_>, out: &mut dyn Write, quiet: bool) 
         writeln!(out)?;
     }
 
+    // The emulation-recovered sections are the ones --by-function
+    // affects: decoded, stack, tight. Their `location.address` is
+    // the function VA. Static and language strings are tied to
+    // file offsets, not functions, so grouping them by VA is
+    // meaningless.
+    let function_grouped = [StringKind::Decoded, StringKind::Stack, StringKind::Tight];
+
     for (label, kinds) in order.iter() {
         let mut combined: Vec<&ExtractedString<'_>> = kinds
             .iter()
@@ -272,9 +293,28 @@ fn print_human(result: &ExtractionResult<'_>, out: &mut dyn Write, quiet: bool) 
         if !quiet {
             writeln!(out, "=== {} ({}) ===", label, combined.len())?;
         }
-        for s in combined {
-            let addr = s.location.address.unwrap_or(s.location.offset);
-            writeln!(out, "{:#018x}  {}", addr, s.value)?;
+
+        // Decide whether to sub-group by function. Only meaningful
+        // for emulation-recovered sections, and only when the user
+        // asked.
+        let section_is_emul = kinds.iter().any(|k| function_grouped.contains(k));
+        if by_function && section_is_emul {
+            let mut by_va: BTreeMap<u64, Vec<&ExtractedString<'_>>> = BTreeMap::new();
+            for s in combined {
+                let va = s.location.address.unwrap_or(0);
+                by_va.entry(va).or_default().push(s);
+            }
+            for (va, items) in &by_va {
+                writeln!(out, "  function {:#018x}  ({} strings)", va, items.len())?;
+                for s in items {
+                    writeln!(out, "    {}", s.value)?;
+                }
+            }
+        } else {
+            for s in combined {
+                let addr = s.location.address.unwrap_or(s.location.offset);
+                writeln!(out, "{:#018x}  {}", addr, s.value)?;
+            }
         }
         if !quiet {
             writeln!(out)?;

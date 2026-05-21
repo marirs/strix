@@ -162,6 +162,7 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
     result.strings.extend(emul.decoded);
     result.strings.extend(emul.stack);
     result.strings.extend(emul.tight);
+    result.candidates = emul.candidates;
     for w in emul.warnings {
         result.warnings.push(w);
     }

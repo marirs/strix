@@ -36,7 +36,7 @@ pub mod emulator;
 pub mod heuristics;
 pub mod stack_strings;
 
-use strix_core::{ExtractOptions, ExtractedString, Result, StringKind};
+use strix_core::{DecoderCandidate, ExtractOptions, ExtractedString, Result, StringKind};
 use strix_format::ParsedInput;
 
 /// Aggregated results from a single emulation pass.
@@ -52,6 +52,11 @@ pub struct EmulationResults<'a> {
     /// are not yet correlated to their dominating block and still
     /// land in `stack`.
     pub tight: Vec<ExtractedString<'a>>,
+    /// Decoder candidates the heuristic ranked above the
+    /// MIN_DECODER_SCORE threshold, in descending score order,
+    /// each annotated with how many strings emulation actually
+    /// produced from it.
+    pub candidates: Vec<DecoderCandidate>,
     /// Non-fatal observations from the run.
     pub warnings: Vec<String>,
 }
@@ -197,7 +202,10 @@ fn run_emulated_pipeline<'a>(
     use strix_core::Location;
 
     use crate::analyzer::CodeAnalyzer;
-    use crate::callsite::{AbsValPub, find_call_sites, make_va_reader, resolve_call_site_regs};
+    use crate::callsite::{
+        AbsValPub, find_call_sites, make_va_reader, resolve_call_site_regs,
+        resolve_call_site_regs_cross_block,
+    };
     use crate::driver::{EmulationDriver, RecoveredKind};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
 
@@ -339,17 +347,23 @@ fn run_emulated_pipeline<'a>(
     // identifiable by their *call shape*: `lea reg, [rip+rdata]`
     // immediately before the call.
     let mut expanded_candidates: BTreeSet<u64> = candidate_vas.iter().copied().collect();
-    for func in funcs.values() {
+    for (caller_va, func) in &funcs {
         for callee in &func.callees {
             if expanded_candidates.contains(callee) {
                 continue;
             }
             // Sample a single call site to test for "concrete arg
             // setup" — if any reachable site has it, the callee is
-            // worth emulating.
+            // worth emulating. Use cross-block dataflow so a pointer
+            // set up in the function prologue (block above the
+            // call) still counts.
             let sites = find_call_sites(&analyzer, &funcs, *callee, 1);
             for site in sites {
-                let regs = resolve_call_site_regs(&analyzer, site, &reader);
+                let regs = if site.caller_va == *caller_va {
+                    resolve_call_site_regs_cross_block(&analyzer, func, site, &reader)
+                } else {
+                    resolve_call_site_regs(&analyzer, site, &reader)
+                };
                 let has_pointer = matches!(regs.rcx, AbsValPub::Pointer(_))
                     || matches!(regs.rdx, AbsValPub::Pointer(_))
                     || matches!(regs.r8, AbsValPub::Pointer(_))
@@ -378,7 +392,15 @@ fn run_emulated_pipeline<'a>(
     for callee in &expanded {
         let sites = find_call_sites(&analyzer, &funcs, *callee, MAX_SITES_PER_CANDIDATE);
         for site in sites {
-            let regs = resolve_call_site_regs(&analyzer, site, &reader);
+            // Cross-block dataflow when we have the caller function:
+            // arg setup commonly straddles the prologue and the
+            // call's block.
+            let regs = match funcs.get(&site.caller_va) {
+                Some(caller_func) => {
+                    resolve_call_site_regs_cross_block(&analyzer, caller_func, site, &reader)
+                }
+                None => resolve_call_site_regs(&analyzer, site, &reader),
+            };
             // Only run if at least one argument register resolved to
             // a concrete value — otherwise we're just duplicating the
             // brute-force fuzzer's schedule.
@@ -420,6 +442,35 @@ fn run_emulated_pipeline<'a>(
     }
 
     let _ = want_tight; // tight is classified by the pattern pass above
+
+    // Surface the ranked candidates plus per-candidate recovery
+    // counts. Strings recovered through emulation are tagged with
+    // their function VA via `location.address`, so we just histogram
+    // by that field. Pattern-recovered stack strings also use
+    // function VA, so they show up here too — which is fine: these
+    // ARE the functions the heuristic flagged, regardless of which
+    // recovery pass surfaced their strings.
+    let mut counts_by_va: std::collections::BTreeMap<u64, u32> =
+        std::collections::BTreeMap::new();
+    for s in out.decoded.iter().chain(out.stack.iter()).chain(out.tight.iter()) {
+        if let Some(addr) = s.location.address {
+            *counts_by_va.entry(addr).or_insert(0) += 1;
+        }
+    }
+    out.candidates = candidates
+        .iter()
+        .map(|(va, score)| DecoderCandidate {
+            va: *va,
+            score: score.score,
+            bitwise_density: score.components.bitwise_density,
+            loop_count: score.components.loop_count,
+            byte_size: score.components.byte_size,
+            caller_count: score.components.caller_count,
+            instruction_count: score.components.instruction_count,
+            import_callee_count: score.components.import_callee_count,
+            recovered_strings: counts_by_va.get(va).copied().unwrap_or(0),
+        })
+        .collect();
 
     Ok(())
 }

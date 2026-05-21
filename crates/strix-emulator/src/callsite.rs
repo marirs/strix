@@ -192,7 +192,7 @@ impl AbsValPub {
 /// up to (and including, for effects) the instruction just before
 /// `call_ip`.
 ///
-/// The `bytes_for_load` callback is invoked when an instruction reads
+/// The `bytes_for_va` callback is invoked when an instruction reads
 /// memory from a known VA — used to resolve `mov reg, [rip+disp]`
 /// into the loaded constant. The callback should return the section
 /// bytes at that VA, or None if the address isn't mapped to anything
@@ -202,27 +202,124 @@ pub fn resolve_call_site_regs(
     site: CallSite,
     bytes_for_va: impl Fn(u64, usize) -> Option<Vec<u8>>,
 ) -> ResolvedRegs {
-    let Some(block_bytes) = analyzer.bytes_at_va(site.block_start) else {
-        return ResolvedRegs::default();
-    };
-    let block_len = site.next_ip.saturating_sub(site.block_start) as usize;
-    let block_len = block_len.min(block_bytes.len());
-    let dec_bytes = &block_bytes[..block_len];
-
     let mut state = RegState::default();
-    let decoder = Decoder::with_ip(
-        analyzer.bitness(),
-        dec_bytes,
-        site.block_start,
-        DecoderOptions::NONE,
-    );
-    for insn in decoder {
-        if insn.ip() == site.call_ip {
-            break;
-        }
-        apply_effect(&mut state, &insn, &bytes_for_va);
+    sweep_call_block(analyzer, site, &bytes_for_va, &mut state);
+    state_to_resolved(&state)
+}
+
+/// Like [`resolve_call_site_regs`] but extends the sweep one
+/// basic-block back through the function's CFG. When the call
+/// block alone yields no concrete arg values (or partial ones)
+/// because the relevant `mov` / `lea` happened a block earlier
+/// (loop header → loop body → call, or check → call), the
+/// predecessor's effects supply the missing pieces.
+///
+/// For multiple incoming predecessors the result keeps only
+/// register values that are concretely equal across every
+/// predecessor — anything that diverges between branches is
+/// downgraded to Unknown, which is the safe conservative
+/// behavior for a register read at a join point.
+pub fn resolve_call_site_regs_cross_block(
+    analyzer: &CodeAnalyzer<'_>,
+    func: &Function,
+    site: CallSite,
+    bytes_for_va: impl Fn(u64, usize) -> Option<Vec<u8>>,
+) -> ResolvedRegs {
+    // First pass: dataflow within the call's own block.
+    let mut local_state = RegState::default();
+    sweep_call_block(analyzer, site, &bytes_for_va, &mut local_state);
+
+    // Collect every block whose successors mention site.block_start.
+    let preds: Vec<u64> = func
+        .blocks
+        .values()
+        .filter(|b| b.start != site.block_start && b.successors.contains(&site.block_start))
+        .map(|b| b.start)
+        .collect();
+
+    if preds.is_empty() {
+        return state_to_resolved(&local_state);
     }
 
+    // Build a per-predecessor "state at the end of the predecessor,
+    // followed by the call block's effects up to the call". We sweep
+    // each predecessor in full, then re-sweep the call block from
+    // its start so any reload / overwrite in the call block wins
+    // over the predecessor's hand-off value.
+    let mut per_pred_states: Vec<RegState> = Vec::with_capacity(preds.len());
+    for pred_start in &preds {
+        let Some(pred_block) = func.blocks.get(pred_start) else {
+            continue;
+        };
+        let mut s = RegState::default();
+        sweep_block_range(
+            analyzer,
+            pred_block.start,
+            pred_block.end,
+            None,
+            &bytes_for_va,
+            &mut s,
+        );
+        sweep_call_block(analyzer, site, &bytes_for_va, &mut s);
+        per_pred_states.push(s);
+    }
+
+    if per_pred_states.is_empty() {
+        return state_to_resolved(&local_state);
+    }
+
+    // Merge: keep register values that agree across every pred-
+    // state. Disagreements become Unknown. If there's only one
+    // predecessor, this is just per_pred_states[0]. Each
+    // per_pred_state already includes the call block's effects
+    // (sweep_call_block was applied after each predecessor sweep),
+    // so this is the authoritative final state.
+    let merged = merge_states(&per_pred_states);
+    state_to_resolved(&merged)
+}
+
+fn sweep_call_block(
+    analyzer: &CodeAnalyzer<'_>,
+    site: CallSite,
+    bytes_for_va: &impl Fn(u64, usize) -> Option<Vec<u8>>,
+    state: &mut RegState,
+) {
+    sweep_block_range(
+        analyzer,
+        site.block_start,
+        site.next_ip,
+        Some(site.call_ip),
+        bytes_for_va,
+        state,
+    );
+}
+
+fn sweep_block_range(
+    analyzer: &CodeAnalyzer<'_>,
+    start: u64,
+    end: u64,
+    stop_at: Option<u64>,
+    bytes_for_va: &impl Fn(u64, usize) -> Option<Vec<u8>>,
+    state: &mut RegState,
+) {
+    let Some(block_bytes) = analyzer.bytes_at_va(start) else {
+        return;
+    };
+    let len = end.saturating_sub(start) as usize;
+    let len = len.min(block_bytes.len());
+    let dec_bytes = &block_bytes[..len];
+    let decoder = Decoder::with_ip(analyzer.bitness(), dec_bytes, start, DecoderOptions::NONE);
+    for insn in decoder {
+        if let Some(stop) = stop_at {
+            if insn.ip() == stop {
+                return;
+            }
+        }
+        apply_effect(state, &insn, bytes_for_va);
+    }
+}
+
+fn state_to_resolved(state: &RegState) -> ResolvedRegs {
     ResolvedRegs {
         rdi: state.get(Register::RDI).into(),
         rsi: state.get(Register::RSI).into(),
@@ -231,6 +328,51 @@ pub fn resolve_call_site_regs(
         r8: state.get(Register::R8).into(),
         r9: state.get(Register::R9).into(),
     }
+}
+
+/// Merge a list of register states: for each register, keep the
+/// value if it's identical across every state that has one;
+/// otherwise drop to Unknown. An empty input returns an empty
+/// state.
+fn merge_states(states: &[RegState]) -> RegState {
+    if states.is_empty() {
+        return RegState::default();
+    }
+    if states.len() == 1 {
+        return states[0].clone();
+    }
+    // Collect every register that any state has tracked.
+    let mut all_regs: std::collections::BTreeSet<Register> =
+        std::collections::BTreeSet::new();
+    for s in states {
+        for r in s.vals.keys() {
+            all_regs.insert(*r);
+        }
+    }
+    let mut out = RegState::default();
+    for r in all_regs {
+        let mut agreed: Option<AbsVal> = None;
+        let mut all_match = true;
+        for s in states {
+            let v = s.vals.get(&r).copied().unwrap_or(AbsVal::Unknown);
+            match agreed {
+                None => agreed = Some(v),
+                Some(prev) if prev == v => {}
+                Some(_) => {
+                    all_match = false;
+                    break;
+                }
+            }
+        }
+        if all_match {
+            if let Some(v) = agreed {
+                if !matches!(v, AbsVal::Unknown) {
+                    out.vals.insert(r, v);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build a `bytes_for_va` callback over a `ParsedInput` and its raw
@@ -781,6 +923,49 @@ mod tests {
         let reader = make_va_reader(&bytes, &parsed);
         let regs = resolve_call_site_regs(&analyzer, site, reader);
         assert_eq!(regs.rdx, AbsValPub::Concrete(0));
+    }
+
+    #[test]
+    fn cross_block_dataflow_chains_through_predecessor() {
+        // Two-block function:
+        //   prologue block @ 0x1000:
+        //     mov ecx, 0xDEAD       ; B9 AD DE 00 00  (5 bytes)
+        //     jmp +0                 ; EB 00          (2 bytes; target = 0x1007)
+        //   call block @ 0x1007:
+        //     call rel32 (target=0x2000)  ; E8 .. (5 bytes)
+        //     ret                        ; C3
+        //
+        // Block-local dataflow on the call block alone sees only
+        // the call. Cross-block dataflow walks the prologue block
+        // first and picks up rcx=0xDEAD.
+        // Call IP = 0x1007. Call next_ip = 0x100C. Target =
+        // next_ip + disp = 0x2000, so disp = 0xFF4.
+        let code: Vec<u8> = vec![
+            0xB9, 0xAD, 0xDE, 0x00, 0x00, // mov ecx, 0xDEAD
+            0xEB, 0x00, // jmp +0 -> 0x1007
+            0xE8, 0xF4, 0x0F, 0x00, 0x00, // call 0x2000
+            0xC3, // ret
+        ];
+        let (bytes, parsed) = parsed_with(&code, 0x1000, &[], 0x2000);
+        let analyzer = CodeAnalyzer::new(&bytes, &parsed);
+        let funcs = analyzer.discover_from_entry(0x1000);
+        let func = funcs.values().next().expect("at least one function");
+        let site = CallSite {
+            caller_va: func.entry,
+            block_start: 0x1007,
+            call_ip: 0x1007,
+            next_ip: 0x100C,
+        };
+        let reader = make_va_reader(&bytes, &parsed);
+
+        // Block-local dataflow should see nothing — the mov is in
+        // the previous block.
+        let local = resolve_call_site_regs(&analyzer, site, &reader);
+        assert_eq!(local.rcx, AbsValPub::Unknown);
+
+        // Cross-block dataflow should resolve rcx = 0xDEAD.
+        let cross = resolve_call_site_regs_cross_block(&analyzer, func, site, &reader);
+        assert_eq!(cross.rcx, AbsValPub::Concrete(0xDEAD));
     }
 
     #[test]

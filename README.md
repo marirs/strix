@@ -75,8 +75,11 @@ strix --no-library malware.exe
 # Drop low-entropy noise (AAAAAA, ////////, +++++++)
 strix --min-quality 0.4 malware.exe
 
+# Group emulation-recovered strings by source function VA
+strix --by-function malware.exe
+
 # Combine: typical analyst usage
-strix --dedupe --no-code --no-library --min-quality 0.4 malware.exe
+strix --dedupe --no-code --no-library --min-quality 0.4 --by-function malware.exe
 
 # Only run specific extractor groups
 strix --only static malware.exe

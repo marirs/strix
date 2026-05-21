@@ -241,6 +241,40 @@ pub struct InputMetadata {
     pub language: Option<String>,
 }
 
+/// One decoder candidate considered by the emulation pipeline.
+///
+/// Surfaced in [`ExtractionResult::candidates`] so analysts can see
+/// which functions the heuristic ranked as decoder-shaped, what
+/// signals went into the score, and how many strings each one
+/// actually produced — useful for tuning thresholds, validating
+/// recoveries against expected behavior, and spotting candidates
+/// that were ranked highly but produced nothing (interesting!).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecoderCandidate {
+    /// Virtual address of the function entry.
+    pub va: u64,
+    /// Composite decoder-likeness score in `[0, 1]`.
+    pub score: f64,
+    /// Fraction of instructions that were bitwise / arithmetic.
+    pub bitwise_density: f64,
+    /// Number of back-edges (loop count proxy).
+    pub loop_count: u32,
+    /// Function size in bytes.
+    pub byte_size: u64,
+    /// Number of distinct callers in the analyzed call graph.
+    pub caller_count: u32,
+    /// Total decoded instruction count.
+    pub instruction_count: u32,
+    /// Number of distinct imports the function calls (via IAT
+    /// indirect calls). High values flag wrapper functions and
+    /// drive down the composite score.
+    pub import_callee_count: u32,
+    /// Number of strings emulation actually recovered from this
+    /// function. Strings are attributed by their `location.address`,
+    /// which the emulator sets to the function VA.
+    pub recovered_strings: u32,
+}
+
 /// Top-level result of an extraction.
 ///
 /// JSON shape is roughly:
@@ -265,6 +299,12 @@ pub struct ExtractionResult<'a> {
     /// All extracted strings.
     #[serde(borrow)]
     pub strings: Vec<ExtractedString<'a>>,
+    /// Decoder-candidate metadata, ordered by descending score.
+    /// Populated by the emulation pipeline; empty for runs that
+    /// didn't enable any emulation-backed kind. Omitted from JSON
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<DecoderCandidate>,
     /// Non-fatal warnings encountered during extraction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -277,6 +317,7 @@ impl<'a> ExtractionResult<'a> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             input,
             strings: Vec::new(),
+            candidates: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -288,6 +329,7 @@ impl<'a> ExtractionResult<'a> {
             version: self.version,
             input: self.input,
             strings: self.strings.into_iter().map(|s| s.into_owned()).collect(),
+            candidates: self.candidates,
             warnings: self.warnings,
         }
     }
