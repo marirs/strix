@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod error;
 pub mod library;
+pub mod quality;
 pub mod traits;
 
 pub use error::{Error, Result};
 pub use library::is_library_string;
+pub use quality::string_quality;
 pub use traits::Extractor;
 
 /// The kind of string that was extracted.
@@ -169,6 +171,13 @@ pub struct ExtractOptions {
     /// the noise from statically-linked runtime libraries. Default
     /// `false`.
     pub skip_library_strings: bool,
+    /// Minimum quality score in `[0.0, 1.0]`. Strings whose
+    /// [`crate::quality::string_quality`] score falls below this
+    /// threshold are dropped from the result. Default `0.0` (no
+    /// filtering). Typical useful values are `0.35`–`0.5`, which
+    /// cuts single-character runs (`AAAAAA`, `//////`) and other
+    /// low-entropy noise without losing real text.
+    pub min_quality: f64,
 }
 
 impl Default for ExtractOptions {
@@ -181,6 +190,7 @@ impl Default for ExtractOptions {
             dedupe: false,
             skip_code_sections: false,
             skip_library_strings: false,
+            min_quality: 0.0,
         }
     }
 }

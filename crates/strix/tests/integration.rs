@@ -20,6 +20,7 @@ fn extracts_ascii_strings_from_raw_bytes() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -40,6 +41,7 @@ fn ascii_strings_borrow_from_input() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.strings.len(), 1);
@@ -60,6 +62,7 @@ fn json_round_trip_is_lossless() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(buf, &opts).expect("extract");
     let json = serde_json::to_string(&result).expect("to_string");
@@ -87,6 +90,7 @@ fn emulation_extractors_do_not_fail() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let _result = extract(buf, &opts).expect("emulation extractors must not error");
 }
@@ -102,6 +106,7 @@ fn unknown_format_falls_back_to_raw_with_warning() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.input.format, "unknown");
@@ -127,6 +132,7 @@ fn utf16le_strings_are_extracted() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(&buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -147,6 +153,7 @@ fn dedupe_drops_repeats() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let opts_drop = ExtractOptions {
         dedupe: true,
@@ -184,10 +191,12 @@ fn skip_code_sections_filters_executable_section_strings() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let opts_drop = ExtractOptions {
         skip_code_sections: true,
         skip_library_strings: false,
+        min_quality: 0.0,
         ..opts_keep.clone()
     };
 
@@ -218,9 +227,11 @@ fn skip_library_strings_filters_curated_set() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let opts_drop = ExtractOptions {
         skip_library_strings: true,
+        min_quality: 0.0,
         ..opts_keep.clone()
     };
 
@@ -241,6 +252,51 @@ fn skip_library_strings_filters_curated_set() {
     );
 }
 
+/// `min_quality` drops low-entropy noise like `AAAAAA` while
+/// preserving real text. The threshold of 0.4 is high enough to
+/// reject single-character runs but low enough to keep typical
+/// short literals.
+#[test]
+fn min_quality_filters_low_entropy_noise() {
+    let buf = b"\x00AAAAAAAA\x00Hello, world!\x00////////\x00";
+
+    let opts_keep = ExtractOptions {
+        min_length: 4,
+        enabled: Some(vec![StringKind::StaticAscii]),
+        format_override: Some(FormatHint::Sc64),
+        max_emulation_steps: 0,
+        dedupe: false,
+        skip_code_sections: false,
+        skip_library_strings: false,
+        min_quality: 0.0,
+    };
+    let opts_drop = ExtractOptions {
+        min_quality: 0.4,
+        ..opts_keep.clone()
+    };
+
+    let kept = extract(buf, &opts_keep).expect("extract");
+    let filtered = extract(buf, &opts_drop).expect("extract");
+
+    // Without filtering, all three strings appear.
+    assert!(kept.strings.iter().any(|s| s.value == "AAAAAAAA"));
+    assert!(kept.strings.iter().any(|s| s.value == "Hello, world!"));
+    assert!(kept.strings.iter().any(|s| s.value == "////////"));
+
+    // With min_quality 0.4, the noise is dropped but real text stays.
+    assert!(filtered.strings.iter().any(|s| s.value == "Hello, world!"));
+    assert!(
+        filtered.strings.iter().all(|s| s.value != "AAAAAAAA"),
+        "AAAAAAAA should be filtered, got {:?}",
+        filtered.strings
+    );
+    assert!(
+        filtered.strings.iter().all(|s| s.value != "////////"),
+        "//////// should be filtered, got {:?}",
+        filtered.strings
+    );
+}
+
 #[test]
 fn empty_input_returns_empty_result() {
     let opts = ExtractOptions {
@@ -251,6 +307,7 @@ fn empty_input_returns_empty_result() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(b"", &opts).expect("extract");
     assert!(result.strings.is_empty());
@@ -302,6 +359,7 @@ fn end_to_end_decoded_extraction_via_public_api() {
         dedupe: false,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     };
     let result = extract(&code, &opts).expect("extract must not error");
 

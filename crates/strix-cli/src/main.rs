@@ -129,6 +129,14 @@ struct Cli {
     /// see program strings, not runtime noise.
     #[arg(long)]
     no_library: bool,
+
+    /// Drop strings whose content-quality score falls below this
+    /// threshold (range 0.0..=1.0). Cuts single-character runs
+    /// (AAAAAA), filler (////////, ++++++), and other low-entropy
+    /// noise. Typical useful values: 0.35 - 0.5. Default 0
+    /// (no filter).
+    #[arg(long, default_value_t = 0.0)]
+    min_quality: f64,
 }
 
 fn main() -> Result<()> {
@@ -178,6 +186,7 @@ fn main() -> Result<()> {
         dedupe: cli.dedupe,
         skip_code_sections: cli.no_code,
         skip_library_strings: cli.no_library,
+        min_quality: cli.min_quality,
     };
 
     let result = strix::extract(bytes, &options)?;

@@ -166,6 +166,17 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
         result.warnings.push(w);
     }
 
+    // Optional quality filter: drop strings whose content-based
+    // score falls below the user's threshold. Applied uniformly
+    // across all extractors since quality is purely a function of
+    // the string's contents.
+    if options.min_quality > 0.0 {
+        let threshold = options.min_quality;
+        result
+            .strings
+            .retain(|s| strix_core::string_quality(&s.value) >= threshold);
+    }
+
     // Sort by (offset, kind) for stable JSON output.
     result.strings.sort_by(|a, b| {
         a.location

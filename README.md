@@ -72,8 +72,11 @@ strix --no-code malware.exe
 # (kernel32.dll, GetProcAddress, "Runtime Error!", ...)
 strix --no-library malware.exe
 
+# Drop low-entropy noise (AAAAAA, ////////, +++++++)
+strix --min-quality 0.4 malware.exe
+
 # Combine: typical analyst usage
-strix --dedupe --no-code --no-library malware.exe
+strix --dedupe --no-code --no-library --min-quality 0.4 malware.exe
 
 # Only run specific extractor groups
 strix --only static malware.exe
@@ -184,6 +187,7 @@ let opts = ExtractOptions {
     dedupe: true,                        // drop duplicate (value, kind, encoding)
     skip_code_sections: true,            // drop static strings in .text / __TEXT,__text
     skip_library_strings: true,          // drop CRT/libc/Windows-API noise
+    min_quality: 0.4,                    // drop AAAAAA, //////, +++++ noise
 };
 
 let bytes = std::fs::read("malware.exe")?;

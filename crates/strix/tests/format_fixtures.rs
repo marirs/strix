@@ -48,6 +48,7 @@ fn opts_all() -> ExtractOptions {
         dedupe: true,
         skip_code_sections: false,
         skip_library_strings: false,
+        min_quality: 0.0,
     }
 }
 
@@ -86,6 +87,7 @@ fn check_fixture(name: &str, expected_format: &str) {
     let opts_nc = ExtractOptions {
         skip_code_sections: true,
         skip_library_strings: false,
+        min_quality: 0.0,
         ..opts_all()
     };
     let no_code = extract(&bytes, &opts_nc).expect("extract --no-code");
