@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 
 pub mod analyzer;
+pub mod callsite;
 #[cfg(feature = "unicorn")]
 pub mod driver;
 #[cfg(feature = "unicorn")]
@@ -53,11 +54,8 @@ pub struct EmulationResults<'a> {
 }
 
 /// Minimum decoder score to bother emulating a candidate function.
-///
-/// Tuned empirically against the decoder fixtures: 0.3 catches the
-/// borderline decoders in `test-decode-from-heap*` and the 64-bit
-/// `single-byte-xor` / `base64` / `substitution-cipher` fixtures
-/// without exploding emulation time on real binaries.
+/// Empirically 0.3 captures the decoders we can currently recover
+/// without spending cycles on functions that aren't going to yield.
 pub const MIN_DECODER_SCORE: f64 = 0.3;
 
 /// Hard cap on the number of candidates we'll emulate per run. Real
@@ -129,6 +127,36 @@ pub fn extract_emulated<'a>(
     }
 }
 
+/// Convert a [`crate::callsite::ResolvedRegs`] into an [`crate::driver::ArgSet`].
+///
+/// For each register: if dataflow resolved a concrete value
+/// (immediate or rdata pointer), pass it through. Otherwise fall
+/// back to a pointer into scratch — this is the right default for
+/// "destination buffer" arguments the decoder will write into and
+/// for "I have no clue but you need *something* here" cases.
+#[cfg(feature = "unicorn")]
+fn resolved_to_argset(
+    layout: &crate::driver::MemoryLayout,
+    regs: crate::callsite::ResolvedRegs,
+) -> crate::driver::ArgSet {
+    use crate::callsite::AbsValPub;
+    let fallback_scratch = layout.scratch_base;
+    let fallback_secondary = layout.secondary_ptr();
+
+    fn val_or(p: AbsValPub, default: u64) -> u64 {
+        p.or(default)
+    }
+
+    crate::driver::ArgSet {
+        rdi: val_or(regs.rdi, fallback_scratch),
+        rsi: val_or(regs.rsi, fallback_secondary),
+        rdx: val_or(regs.rdx, 64),
+        rcx: val_or(regs.rcx, fallback_scratch),
+        r8: val_or(regs.r8, fallback_secondary),
+        r9: val_or(regs.r9, 64),
+    }
+}
+
 #[cfg(feature = "unicorn")]
 fn run_emulated_pipeline<'a>(
     input: &'a [u8],
@@ -142,6 +170,7 @@ fn run_emulated_pipeline<'a>(
     use strix_core::Location;
 
     use crate::analyzer::CodeAnalyzer;
+    use crate::callsite::{find_call_sites, make_va_reader, resolve_call_site_regs};
     use crate::driver::{EmulationDriver, RecoveredKind};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
 
@@ -234,6 +263,10 @@ fn run_emulated_pipeline<'a>(
     const MAX_CALLERS_PER_CANDIDATE: usize = 3;
     let mut callers_attempted: u32 = 0;
     let mut callers_errors: u32 = 0;
+    // Caller emulation has to walk the full prologue and any setup
+    // calls (HeapAlloc, memcpy, etc.) before reaching the decoder.
+    // Give it more headroom than the brute-force fuzzer's cap.
+    let caller_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
     for callee in &candidate_vas {
         let callers: Vec<u64> = funcs
             .iter()
@@ -243,7 +276,7 @@ fn run_emulated_pipeline<'a>(
             .collect();
         for caller in callers {
             callers_attempted += 1;
-            match driver.run_function_fuzzed(caller, options.max_emulation_steps) {
+            match driver.run_function_fuzzed(caller, caller_step_cap) {
                 Ok(r) => push_recovered(r, out, &mut callers_errors),
                 Err(_) => callers_errors += 1,
             }
@@ -255,6 +288,102 @@ fn run_emulated_pipeline<'a>(
              call-site argument extraction yielded no additional strings"
         ));
     }
+
+    // 5. Symbolic dataflow at the actual decoder call site. The
+    //    caller-emulation pass above runs the *whole* caller from
+    //    its entry, which often faults somewhere unrelated. The
+    //    pass below skips ahead to each call instruction's basic
+    //    block, walks the block forward tracking register values
+    //    through `mov`, `lea rip-relative`, `xor reg,reg`, etc., and
+    //    runs the decoder directly with the resolved argument
+    //    register values. This is the only way to recover decoders
+    //    whose source pointer is set by `lea rcx, [rip+disp]`
+    //    pointing at .rdata — those don't appear in the brute-force
+    //    fuzzer schedule (which always points args at scratch).
+    const MAX_SITES_PER_CANDIDATE: usize = 6;
+    let mut sites_emulated: u32 = 0;
+    let mut sites_yielded: u32 = 0;
+    let reader = make_va_reader(input, parsed);
+
+    // Build an expanded candidate set: the score-ranked candidates
+    // PLUS any function called from a site with concrete arg setup.
+    // The latter catches small decoders (single-byte XOR, ROL/ROR
+    // loops) that score below the heuristic threshold but are
+    // identifiable by their *call shape*: `lea reg, [rip+rdata]`
+    // immediately before the call.
+    let mut expanded_candidates: std::collections::BTreeSet<u64> =
+        candidate_vas.iter().copied().collect();
+    for (_caller_va, func) in &funcs {
+        for callee in &func.callees {
+            if expanded_candidates.contains(callee) {
+                continue;
+            }
+            // Sample a single call site to test for "concrete arg
+            // setup" — if any reachable site has it, the callee is
+            // worth emulating.
+            let sites = find_call_sites(&analyzer, &funcs, *callee, 1);
+            for site in sites {
+                let regs = resolve_call_site_regs(&analyzer, site, &reader);
+                let has_pointer = matches!(regs.rcx, crate::callsite::AbsValPub::Pointer(_))
+                    || matches!(regs.rdx, crate::callsite::AbsValPub::Pointer(_))
+                    || matches!(regs.r8, crate::callsite::AbsValPub::Pointer(_))
+                    || matches!(regs.rdi, crate::callsite::AbsValPub::Pointer(_))
+                    || matches!(regs.rsi, crate::callsite::AbsValPub::Pointer(_));
+                if has_pointer {
+                    expanded_candidates.insert(*callee);
+                }
+            }
+        }
+    }
+    // Bound the expansion so we don't emulate every helper function
+    // in a 1000-function binary.
+    let expanded: Vec<u64> = expanded_candidates
+        .iter()
+        .copied()
+        .take(MAX_CANDIDATES * 2)
+        .collect();
+
+    // Bump the step cap for callsite-dataflow runs. The brute-force
+    // fuzzer uses options.max_emulation_steps as-is; here we give
+    // each decoder more headroom since we expect the run to actually
+    // produce output (we've staged real args).
+    let callsite_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
+
+    for callee in &expanded {
+        let sites = find_call_sites(&analyzer, &funcs, *callee, MAX_SITES_PER_CANDIDATE);
+        for site in sites {
+            let regs = resolve_call_site_regs(&analyzer, site, &reader);
+            // Only run if at least one argument register resolved to
+            // a concrete value — otherwise we're just duplicating the
+            // brute-force fuzzer's schedule.
+            if !(regs.rcx.is_known()
+                || regs.rdx.is_known()
+                || regs.r8.is_known()
+                || regs.r9.is_known()
+                || regs.rdi.is_known()
+                || regs.rsi.is_known())
+            {
+                continue;
+            }
+            sites_emulated += 1;
+            let arg_set = resolved_to_argset(&driver.layout, regs);
+            match driver.run_function_with(*callee, callsite_step_cap, &[arg_set]) {
+                Ok(r) => {
+                    let prev_decoded = out.decoded.len();
+                    let prev_stack = out.stack.len();
+                    push_recovered(r, out, &mut driver_errors);
+                    if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
+                        sites_yielded += 1;
+                    }
+                }
+                Err(_) => driver_errors += 1,
+            }
+        }
+    }
+    log::debug!(
+        target: "strix::emulator",
+        "callsite dataflow: emulated {sites_emulated} sites, {sites_yielded} produced new strings"
+    );
 
     if driver_errors > 0 {
         out.warnings.push(format!(

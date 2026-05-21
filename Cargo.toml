@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -23,11 +23,11 @@ categories = ["command-line-utilities", "parser-implementations"]
 
 [workspace.dependencies]
 # Internal crates
-strix-core      = { version = "0.1.0", path = "crates/strix-core" }
-strix-format    = { version = "0.1.0", path = "crates/strix-format" }
-strix-static    = { version = "0.1.0", path = "crates/strix-static" }
-strix-lang      = { version = "0.1.0", path = "crates/strix-lang" }
-strix-emulator  = { version = "0.1.0", path = "crates/strix-emulator" }
+strix-core      = { version = "0.1.1", path = "crates/strix-core" }
+strix-format    = { version = "0.1.1", path = "crates/strix-format" }
+strix-static    = { version = "0.1.1", path = "crates/strix-static" }
+strix-lang      = { version = "0.1.1", path = "crates/strix-lang" }
+strix-emulator  = { version = "0.1.1", path = "crates/strix-emulator" }
 
 # Third-party — pinned to major lines so cargo picks the latest compatible release.
 serde       = { version = "1", features = ["derive"] }

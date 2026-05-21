@@ -12,7 +12,7 @@ name = "strix"
 path = "src/main.rs"
 
 [dependencies]
-strix = { path = "../strix", version = "0.1.0" }
+strix = { path = "../strix", version = "0.1.1" }
 strix-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

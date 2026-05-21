@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use strix_core::{Encoding, Result};
 use strix_format::ParsedInput;
-use unicorn_engine::{RegisterX86, Unicorn};
+use unicorn_engine::{HookType, Prot, RegisterX86, Unicorn};
 
 use crate::emulator::CpuEmulator;
 
@@ -127,7 +127,23 @@ struct HookState {
     heap_end: u64,
     /// Reset target for heap_ptr at the start of each run.
     heap_base: u64,
+    /// Set of pages the lazy-mapping hook has already created
+    /// during this run. Used to (a) skip the hook quickly when the
+    /// access is on a page we've already lazy-mapped (Unicorn might
+    /// re-fire the hook in some edge cases) and (b) enforce a hard
+    /// cap so a wild pointer chase doesn't blow past QEMU's
+    /// internal `phys_section_add` limit (4096 sections).
+    lazy_pages: HashSet<u64>,
 }
+
+/// Hard cap on the number of pages the lazy-mapping hook will
+/// create during a single emulation run. QEMU's internal section
+/// table is bounded at `TARGET_PAGE_SIZE` (4096) entries; with our
+/// pre-mapped sections plus the binary's own sections, we have a
+/// few hundred slots of headroom. 256 lazy pages = 1 MB of extra
+/// memory, which is plenty to satisfy any legitimate run while
+/// staying safely under the limit.
+const MAX_LAZY_PAGES: usize = 256;
 
 /// One set of register values to try when emulating a candidate.
 ///
@@ -280,6 +296,7 @@ impl EmulationDriver {
             heap_ptr: layout.heap_base,
             heap_end: layout.heap_base.saturating_add(layout.heap_size),
             heap_base: layout.heap_base,
+            lazy_pages: HashSet::new(),
         }));
 
         // Install a Unicorn code hook over the stub region. Each time
@@ -297,6 +314,59 @@ impl EmulationDriver {
             .map_err(|e| {
                 strix_core::Error::Other(format!("unicorn add_code_hook failed: {e:?}"))
             })?;
+
+        // Lazy memory-mapping hook. When emulated code accesses an
+        // address that isn't mapped (read, write, or fetch), we try
+        // to map a 4KB page there on-the-fly and return `true` so
+        // Unicorn retries the access. This turns most "would have
+        // faulted on a stray pointer" errors into "read zeros from
+        // a fresh page" and lets caller emulation push through
+        // weird CRT init code, TLS reads, and similar without
+        // bailing out. The page count is hard-capped per run via
+        // `MAX_LAZY_PAGES` so QEMU's internal section table doesn't
+        // overflow (which abort()s the whole test process).
+        let state_for_mem_hook = Arc::clone(&state);
+        let _ = emu.uc.add_mem_hook(
+            HookType::MEM_READ_UNMAPPED
+                | HookType::MEM_WRITE_UNMAPPED
+                | HookType::MEM_FETCH_UNMAPPED,
+            1,
+            u64::MAX,
+            move |uc, _mtype, addr, _size, _value| {
+                // Round down to a 4KB page boundary.
+                let page = addr & !0xFFFu64;
+                // Refuse to map page 0 (NULL deref) and pages that
+                // look like uninitialized-stack sentinels
+                // (0xCCCC..., 0xDDDD..., 0xFEFE..., 0xFFFF...).
+                if page == 0 {
+                    return false;
+                }
+                let high_byte = (addr >> 56) & 0xFF;
+                if matches!(high_byte, 0xCC | 0xDD | 0xFE | 0xFF) {
+                    return false;
+                }
+                // Enforce the per-run cap and dedupe (the hook can
+                // re-fire for the same page across different access
+                // types). Hold the lock just long enough to check.
+                let Ok(mut st) = state_for_mem_hook.lock() else {
+                    return false;
+                };
+                if st.lazy_pages.contains(&page) {
+                    // Already mapped this run — let Unicorn retry.
+                    return true;
+                }
+                if st.lazy_pages.len() >= MAX_LAZY_PAGES {
+                    return false;
+                }
+                st.lazy_pages.insert(page);
+                drop(st);
+                // Ignore mem_map failure — typically means the page
+                // is already mapped (the access faulted on perms,
+                // not bounds), in which case retrying is fine.
+                let _ = uc.mem_map(page, 0x1000, Prot::ALL);
+                true
+            },
+        );
 
         Ok(Self { emu, layout, state })
     }
@@ -657,6 +727,79 @@ fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, bits:
 
         // ---- "got an error" stubs ----
         "getlasterror" => 0,
+        "setlasterror" => 0,
+
+        // ---- handle returns (any non-zero so callers don't short-circuit) ----
+        "getprocessheap"
+        | "getstdhandle"
+        | "getmodulehandlea"
+        | "getmodulehandlew"
+        | "getcurrentprocess"
+        | "getcurrentthread"
+        | "getcurrentprocessid"
+        | "getcurrentthreadid"
+        | "loadlibrarya"
+        | "loadlibraryw"
+        | "loadlibraryexa"
+        | "loadlibraryexw"
+        | "getprocaddress"
+        | "createfilea"
+        | "createfilew"
+        | "openprocess"
+        | "createthread"
+        | "createheap"
+        | "heapcreate" => 1,
+
+        // ---- queries that return a count / size (zero is fine) ----
+        "getfilesize"
+        | "gettickcount"
+        | "gettickcount64"
+        | "queryperformancecounter"
+        | "queryperformancefrequency"
+        | "getsystemtimeasfiletime"
+        | "writefile"
+        | "readfile"
+        | "closehandle" => 1,
+
+        // ---- output / no-op writes ----
+        "printf"
+        | "fprintf"
+        | "vfprintf"
+        | "puts"
+        | "fputs"
+        | "putchar"
+        | "_cprintf"
+        | "_printf"
+        | "outputdebugstringa"
+        | "outputdebugstringw" => 0,
+
+        // ---- string length variants ----
+        "lstrlenw" => {
+            let p = arg(uc, 0);
+            if p == 0 { 0 } else { wcslen_emu(uc, p) }
+        }
+        "wcslen" => {
+            let p = arg(uc, 0);
+            if p == 0 { 0 } else { wcslen_emu(uc, p) }
+        }
+
+        // ---- _alloca / chkstk: stack-probe shim. We don't model the
+        //      probe, just return without faulting. The real call
+        //      lowers rsp; if the binary depends on that we'll see a
+        //      mismatch later. But for our short emulation windows it
+        //      almost never matters. ----
+        "_alloca" | "__chkstk" | "_chkstk" | "alloca_probe" => 0,
+
+        // ---- exit shims (binary calls these from CRT teardown) ----
+        "exitprocess" | "exit" | "_exit" | "quick_exit" | "abort" => {
+            // Force the magic-return so emulation stops cleanly.
+            // We can't actually mutate RIP from here easily without
+            // disturbing the stub's natural ret; the natural ret will
+            // pop the caller's return addr. For ExitProcess called
+            // from main, the caller is mainCRTStartup which falls off
+            // the end — emulation will eventually hit max_steps.
+            0
+        }
 
         // ---- anything else ----
         _ => 0,
@@ -699,6 +842,26 @@ fn strlen_emu(uc: &mut Unicorn<'_, ()>, p: u64) -> u64 {
             break;
         }
         if b[0] == 0 {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// UTF-16LE strlen: walk `p` in 2-byte units until a NUL u16 (or
+/// 64K chars), returning the count in characters.
+fn wcslen_emu(uc: &mut Unicorn<'_, ()>, p: u64) -> u64 {
+    let mut len: u64 = 0;
+    while len < 0x10_000 {
+        let mut b = [0u8; 2];
+        if uc
+            .mem_read(p.saturating_add(len.saturating_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if b[0] == 0 && b[1] == 0 {
             break;
         }
         len += 1;
