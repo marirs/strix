@@ -762,16 +762,8 @@ fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, bits:
         | "closehandle" => 1,
 
         // ---- output / no-op writes ----
-        "printf"
-        | "fprintf"
-        | "vfprintf"
-        | "puts"
-        | "fputs"
-        | "putchar"
-        | "_cprintf"
-        | "_printf"
-        | "outputdebugstringa"
-        | "outputdebugstringw" => 0,
+        "printf" | "fprintf" | "vfprintf" | "puts" | "fputs" | "putchar" | "_cprintf"
+        | "_printf" | "outputdebugstringa" | "outputdebugstringw" => 0,
 
         // ---- string length variants ----
         "lstrlenw" => {

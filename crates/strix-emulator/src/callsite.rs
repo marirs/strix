@@ -22,7 +22,7 @@
 //! through `mov` / `lea` / `xor reg,reg` / `add reg, imm`. By the
 //! time we reach the call, we typically have concrete values (or
 //! known-pointer-into-rdata values) for the arg-passing registers.
-//! We bake those into an [`ArgSet`] and run the decoder directly.
+//! We bake those into an `ArgSet` and run the decoder directly.
 //!
 //! What we deliberately don't do:
 //!
@@ -37,9 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use iced_x86::{
-    ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register,
-};
+use iced_x86::{ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use strix_format::ParsedInput;
 
 use crate::analyzer::{CodeAnalyzer, Function};
@@ -361,18 +359,10 @@ fn slot_key_for_memory(insn: &Instruction) -> Option<SlotKey> {
 /// (Unknown), which is safer than pretending we still know it.
 fn full_reg(r: Register) -> Register {
     match r {
-        Register::RAX | Register::EAX | Register::AX | Register::AL | Register::AH => {
-            Register::RAX
-        }
-        Register::RBX | Register::EBX | Register::BX | Register::BL | Register::BH => {
-            Register::RBX
-        }
-        Register::RCX | Register::ECX | Register::CX | Register::CL | Register::CH => {
-            Register::RCX
-        }
-        Register::RDX | Register::EDX | Register::DX | Register::DL | Register::DH => {
-            Register::RDX
-        }
+        Register::RAX | Register::EAX | Register::AX | Register::AL | Register::AH => Register::RAX,
+        Register::RBX | Register::EBX | Register::BX | Register::BL | Register::BH => Register::RBX,
+        Register::RCX | Register::ECX | Register::CX | Register::CL | Register::CH => Register::RCX,
+        Register::RDX | Register::EDX | Register::DX | Register::DL | Register::DH => Register::RDX,
         Register::RSI | Register::ESI | Register::SI | Register::SIL => Register::RSI,
         Register::RDI | Register::EDI | Register::DI | Register::DIL => Register::RDI,
         Register::RBP | Register::EBP | Register::BP | Register::BPL => Register::RBP,
@@ -496,9 +486,7 @@ fn handle_mov(
                 OpKind::Immediate8 | OpKind::Immediate8to16 => {
                     AbsVal::Concrete(insn.immediate8() as i8 as i64 as u64)
                 }
-                OpKind::Immediate8to32 => {
-                    AbsVal::Concrete(insn.immediate8to32() as i64 as u64)
-                }
+                OpKind::Immediate8to32 => AbsVal::Concrete(insn.immediate8to32() as i64 as u64),
                 OpKind::Immediate8to64 => AbsVal::Concrete(insn.immediate8to64() as u64),
                 OpKind::Immediate16 => AbsVal::Concrete(insn.immediate16() as u64),
                 OpKind::Immediate32 => AbsVal::Concrete(insn.immediate32() as u64),
@@ -521,12 +509,10 @@ fn handle_mov(
         return;
     }
     let value = match insn.op1_kind() {
-        OpKind::Immediate8 | OpKind::Immediate8to16 => Some(AbsVal::Concrete(
-            insn.immediate8() as i8 as i64 as u64,
-        )),
-        OpKind::Immediate8to32 => Some(AbsVal::Concrete(
-            insn.immediate8to32() as i64 as u64,
-        )),
+        OpKind::Immediate8 | OpKind::Immediate8to16 => {
+            Some(AbsVal::Concrete(insn.immediate8() as i8 as i64 as u64))
+        }
+        OpKind::Immediate8to32 => Some(AbsVal::Concrete(insn.immediate8to32() as i64 as u64)),
         OpKind::Immediate8to64 => Some(AbsVal::Concrete(insn.immediate8to64() as u64)),
         OpKind::Immediate16 => Some(AbsVal::Concrete(insn.immediate16() as u64)),
         OpKind::Immediate32 => Some(AbsVal::Concrete(insn.immediate32() as u64)),
@@ -680,7 +666,12 @@ mod tests {
     use strix_core::InputMetadata;
     use strix_format::{ParsedInput, Section};
 
-    fn parsed_with(code: &[u8], code_va: u64, rdata: &[u8], rdata_va: u64) -> (Vec<u8>, ParsedInput) {
+    fn parsed_with(
+        code: &[u8],
+        code_va: u64,
+        rdata: &[u8],
+        rdata_va: u64,
+    ) -> (Vec<u8>, ParsedInput) {
         // Layout the input file as: [code][rdata], record their file
         // offsets in the section list so the analyzer can resolve VAs.
         let mut bytes = Vec::new();

@@ -127,7 +127,8 @@ pub fn extract_emulated<'a>(
     }
 }
 
-/// Convert a [`crate::callsite::ResolvedRegs`] into an [`crate::driver::ArgSet`].
+/// Convert a `ResolvedRegs` from the callsite-dataflow pass into a
+/// concrete `ArgSet` the emulation driver can run with.
 ///
 /// For each register: if dataflow resolved a concrete value
 /// (immediate or rdata pointer), pass it through. Otherwise fall
@@ -166,11 +167,12 @@ fn run_emulated_pipeline<'a>(
     out: &mut EmulationResults<'a>,
 ) -> Result<()> {
     use std::borrow::Cow;
+    use std::collections::BTreeSet;
 
     use strix_core::Location;
 
     use crate::analyzer::CodeAnalyzer;
-    use crate::callsite::{find_call_sites, make_va_reader, resolve_call_site_regs};
+    use crate::callsite::{AbsValPub, find_call_sites, make_va_reader, resolve_call_site_regs};
     use crate::driver::{EmulationDriver, RecoveredKind};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
 
@@ -311,9 +313,8 @@ fn run_emulated_pipeline<'a>(
     // loops) that score below the heuristic threshold but are
     // identifiable by their *call shape*: `lea reg, [rip+rdata]`
     // immediately before the call.
-    let mut expanded_candidates: std::collections::BTreeSet<u64> =
-        candidate_vas.iter().copied().collect();
-    for (_caller_va, func) in &funcs {
+    let mut expanded_candidates: BTreeSet<u64> = candidate_vas.iter().copied().collect();
+    for func in funcs.values() {
         for callee in &func.callees {
             if expanded_candidates.contains(callee) {
                 continue;
@@ -324,11 +325,11 @@ fn run_emulated_pipeline<'a>(
             let sites = find_call_sites(&analyzer, &funcs, *callee, 1);
             for site in sites {
                 let regs = resolve_call_site_regs(&analyzer, site, &reader);
-                let has_pointer = matches!(regs.rcx, crate::callsite::AbsValPub::Pointer(_))
-                    || matches!(regs.rdx, crate::callsite::AbsValPub::Pointer(_))
-                    || matches!(regs.r8, crate::callsite::AbsValPub::Pointer(_))
-                    || matches!(regs.rdi, crate::callsite::AbsValPub::Pointer(_))
-                    || matches!(regs.rsi, crate::callsite::AbsValPub::Pointer(_));
+                let has_pointer = matches!(regs.rcx, AbsValPub::Pointer(_))
+                    || matches!(regs.rdx, AbsValPub::Pointer(_))
+                    || matches!(regs.r8, AbsValPub::Pointer(_))
+                    || matches!(regs.rdi, AbsValPub::Pointer(_))
+                    || matches!(regs.rsi, AbsValPub::Pointer(_));
                 if has_pointer {
                     expanded_candidates.insert(*callee);
                 }
