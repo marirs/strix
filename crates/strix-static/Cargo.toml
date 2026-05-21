@@ -1,0 +1,12 @@
+[package]
+name = "strix-static"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-copy static string extraction for strix"
+rust-version.workspace = true
+
+[dependencies]
+strix-core = { workspace = true }
+memchr = { workspace = true }

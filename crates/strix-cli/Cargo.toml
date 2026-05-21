@@ -1,0 +1,25 @@
+[package]
+name = "strix-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for strix — extract obfuscated strings from binaries"
+rust-version.workspace = true
+
+[[bin]]
+name = "strix"
+path = "src/main.rs"
+
+[dependencies]
+strix = { path = "../strix", version = "0.1.0" }
+strix-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+env_logger = { workspace = true }
+
+[features]
+default = []
+unicorn = ["strix/unicorn"]

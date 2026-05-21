@@ -1,0 +1,24 @@
+[package]
+name = "strix-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CPU emulation + code analysis layer for strix's decoded/stack/tight extractors"
+rust-version.workspace = true
+
+[dependencies]
+strix-core = { workspace = true }
+strix-format = { workspace = true }
+iced-x86 = { workspace = true }
+log = { workspace = true }
+
+[features]
+default = []
+# Gate Unicorn behind a feature so users who only need static + lang
+# strings don't have to link the C library.
+unicorn = ["dep:unicorn-engine"]
+
+[dependencies.unicorn-engine]
+version = "2"
+optional = true

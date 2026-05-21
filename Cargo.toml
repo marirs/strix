@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/strix-core",
+    "crates/strix-format",
+    "crates/strix-static",
+    "crates/strix-lang",
+    "crates/strix-emulator",
+    "crates/strix",
+    "crates/strix-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+authors = ["Sriram <marirs@gmail.com>"]
+repository = "https://github.com/marirs/strix"
+description = "Extract obfuscated strings from binaries"
+keywords = ["malware", "strings", "deobfuscation", "reverse-engineering", "binary-analysis"]
+categories = ["command-line-utilities", "parser-implementations"]
+
+[workspace.dependencies]
+# Internal crates
+strix-core      = { version = "0.1.0", path = "crates/strix-core" }
+strix-format    = { version = "0.1.0", path = "crates/strix-format" }
+strix-static    = { version = "0.1.0", path = "crates/strix-static" }
+strix-lang      = { version = "0.1.0", path = "crates/strix-lang" }
+strix-emulator  = { version = "0.1.0", path = "crates/strix-emulator" }
+
+# Third-party — pinned to major lines so cargo picks the latest compatible release.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+goblin      = { version = "0.9", default-features = false, features = ["pe32", "pe64", "elf32", "elf64", "mach32", "mach64", "te", "endian_fd", "std"] }
+memchr      = "2"
+thiserror   = "2"
+bytemuck    = { version = "1", features = ["derive"] }
+log         = "0.4"
+env_logger  = "0.11"
+clap        = { version = "4", features = ["derive"] }
+anyhow      = "1"
+memmap2     = "0.9"
+iced-x86    = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true

@@ -1,0 +1,26 @@
+[package]
+name = "strix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Extract obfuscated strings from binaries"
+keywords = ["malware", "strings", "deobfuscation", "reverse-engineering", "binary-analysis"]
+categories = ["command-line-utilities", "parser-implementations"]
+rust-version.workspace = true
+
+[dependencies]
+strix-core      = { workspace = true }
+strix-format    = { workspace = true }
+strix-static    = { workspace = true }
+strix-lang      = { workspace = true }
+strix-emulator  = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[features]
+default = []
+# Forward the emulator's `unicorn` feature so users who want the
+# decoded/stack/tight extractors can opt in.
+unicorn = ["strix-emulator/unicorn"]

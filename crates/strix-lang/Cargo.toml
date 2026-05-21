@@ -1,0 +1,13 @@
+[package]
+name = "strix-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Language-specific string extraction (Go, Rust) for strix"
+rust-version.workspace = true
+
+[dependencies]
+strix-core = { workspace = true }
+strix-format = { workspace = true }
+memchr = { workspace = true }
