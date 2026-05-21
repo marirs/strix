@@ -307,6 +307,15 @@ impl<'a> CodeAnalyzer<'a> {
                     FlowControl::Call => {
                         kind = BlockKind::Call;
                         if let Some(t) = direct_branch_target(&insn) {
+                            // Direct calls that land on a PLT-style
+                            // import thunk (`jmp [rip+got]`) should
+                            // count as imported callees, not as
+                            // ordinary function calls. The PLT itself
+                            // is still recorded in `callees` so the
+                            // call graph stays complete.
+                            if let Some(iat_va) = self.is_plt_thunk(t) {
+                                imported_callees.insert(iat_va);
+                            }
                             callees.insert(t);
                         }
                         // Calls fall through.
@@ -404,6 +413,56 @@ impl<'a> CodeAnalyzer<'a> {
             return None;
         };
         // Match against the known import table.
+        if self.parsed.imports.iter().any(|imp| imp.iat_va == target) {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    /// If `va` looks like a PLT-style import thunk
+    /// (`jmp qword ptr [rip+got_disp]`, optionally followed by a
+    /// push/jmp lazy-resolver stub), return the GOT VA the thunk
+    /// dispatches through. The GOT VA is matched against
+    /// `parsed.imports` by the caller.
+    ///
+    /// ELF PLT entries are 16 bytes:
+    ///   `jmp qword ptr [rip+got_disp]`  (6 bytes)
+    ///   `push imm32`                   (5 bytes)
+    ///   `jmp .plt0`                    (5 bytes)
+    /// The first instruction is the only one we need. Some binaries
+    /// also emit a `.plt.got` section with just the jmp.
+    ///
+    /// Returns `None` if `va` doesn't decode to a `jmp [rip+disp]`
+    /// (or `jmp [abs]` on 32-bit), or if the resolved GOT VA isn't
+    /// in our imports table.
+    pub fn is_plt_thunk(&self, va: u64) -> Option<u64> {
+        let bytes = self.bytes_at_va(va)?;
+        // A PLT thunk's first instruction is at most 7 bytes
+        // (FF 25 disp32, or FF 25 disp32 with REX). Bound the
+        // decode so we don't accidentally walk into adjacent code.
+        let look = bytes.get(..8).unwrap_or(bytes);
+        let mut decoder = Decoder::with_ip(self.bitness, look, va, DecoderOptions::NONE);
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            return None;
+        }
+        if insn.mnemonic() != iced_x86::Mnemonic::Jmp {
+            return None;
+        }
+        if insn.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        if insn.memory_index() != iced_x86::Register::None {
+            return None;
+        }
+        let target = if insn.is_ip_rel_memory_operand() {
+            insn.ip_rel_memory_address()
+        } else if insn.memory_base() == iced_x86::Register::None {
+            insn.memory_displacement64()
+        } else {
+            return None;
+        };
         if self.parsed.imports.iter().any(|imp| imp.iat_va == target) {
             Some(target)
         } else {

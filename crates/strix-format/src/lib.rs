@@ -209,6 +209,49 @@ fn parse_elf(input: &[u8]) -> Result<ParsedInput> {
             })
         })
         .collect();
+
+    // Build the imports table from JUMP_SLOT-style relocations in
+    // the dynamic relocation tables. Each entry is `(got_va,
+    // symbol_name)`. We treat the .so this comes from as
+    // unknown — ELF dynamic relocs don't carry per-symbol library
+    // info; libraries are listed separately in DT_NEEDED. The
+    // analyzer just needs the GOT VA to wire indirect-call
+    // resolution.
+    let mut imports: Vec<Import> = Vec::new();
+    let mut seen_iat: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // pltrelocs is the .rela.plt / .rel.plt table (lazy-bound
+    // functions). dynrelas covers eager-bound entries too.
+    let reloc_tables: Vec<&goblin::elf::reloc::RelocSection<'_>> =
+        vec![&elf.pltrelocs, &elf.dynrelas, &elf.dynrels];
+    for rels in reloc_tables {
+        for rel in rels.iter() {
+            // R_X86_64_JUMP_SLOT = 7, R_386_JMP_SLOT = 7,
+            // R_AARCH64_JUMP_SLOT = 1026, R_ARM_JUMP_SLOT = 22.
+            // We accept all of them; non-matching reloc types
+            // simply won't have a symbol name we'd want to record.
+            let sym_idx = rel.r_sym;
+            let Some(sym) = elf.dynsyms.get(sym_idx) else {
+                continue;
+            };
+            let name = match elf.dynstrtab.get_at(sym.st_name) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            let got_va = rel.r_offset;
+            if !seen_iat.insert(got_va) {
+                continue;
+            }
+            imports.push(Import {
+                // ELF dynamic relocs don't tag the per-symbol
+                // library; using an empty string keeps the field
+                // present without misleading consumers.
+                library: String::new(),
+                name,
+                iat_va: got_va,
+            });
+        }
+    }
+
     Ok(ParsedInput {
         metadata: InputMetadata {
             format: "elf".to_string(),
@@ -221,7 +264,7 @@ fn parse_elf(input: &[u8]) -> Result<ParsedInput> {
         entry: Some(elf.entry),
         warnings: Vec::new(),
         scan_window: None,
-        imports: Vec::new(),
+        imports,
     })
 }
 
@@ -318,6 +361,28 @@ fn parse_macho(input: &[u8]) -> Result<ParsedInput> {
             }
         }
     }
+    // Build the imports table from Mach-O bind info. Each bind
+    // record describes a runtime fixup of a pointer in
+    // __DATA,__got / __DATA,__la_symbol_ptr / __DATA_CONST,__got
+    // etc. to an external symbol. The fixup address is the GOT
+    // entry the binary uses for `call [rip+disp]` indirection,
+    // which is exactly what we need for indirect-call resolution.
+    let mut imports: Vec<Import> = Vec::new();
+    if let Ok(mach_imports) = mo.imports() {
+        let mut seen_iat: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for imp in mach_imports {
+            let iat_va = imp.address;
+            if !seen_iat.insert(iat_va) {
+                continue;
+            }
+            imports.push(Import {
+                library: imp.dylib.to_string(),
+                name: imp.name.to_string(),
+                iat_va,
+            });
+        }
+    }
+
     Ok(ParsedInput {
         metadata: InputMetadata {
             format: "macho".to_string(),
@@ -330,7 +395,7 @@ fn parse_macho(input: &[u8]) -> Result<ParsedInput> {
         entry: None,
         warnings,
         scan_window,
-        imports: Vec::new(),
+        imports,
     })
 }
 
