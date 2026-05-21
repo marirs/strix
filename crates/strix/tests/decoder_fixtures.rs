@@ -55,6 +55,7 @@ fn opts() -> ExtractOptions {
         max_emulation_steps: 5_000,
         dedupe: true,
         skip_code_sections: false,
+        skip_library_strings: false,
     }
 }
 

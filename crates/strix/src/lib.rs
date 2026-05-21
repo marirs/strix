@@ -126,6 +126,9 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
             if options.skip_code_sections && in_code {
                 continue;
             }
+            if options.skip_library_strings && strix_core::is_library_string(&s.value) {
+                continue;
+            }
             if let Some(sec) = parsed.section_at(s.location.offset) {
                 s.location.address = sec.offset_to_va(s.location.offset);
                 s.location.section = Some(sec.name.clone());

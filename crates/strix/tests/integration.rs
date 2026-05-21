@@ -19,6 +19,7 @@ fn extracts_ascii_strings_from_raw_bytes() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -38,6 +39,7 @@ fn ascii_strings_borrow_from_input() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.strings.len(), 1);
@@ -57,6 +59,7 @@ fn json_round_trip_is_lossless() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(buf, &opts).expect("extract");
     let json = serde_json::to_string(&result).expect("to_string");
@@ -83,6 +86,7 @@ fn emulation_extractors_do_not_fail() {
         max_emulation_steps: 1_000,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let _result = extract(buf, &opts).expect("emulation extractors must not error");
 }
@@ -97,6 +101,7 @@ fn unknown_format_falls_back_to_raw_with_warning() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.input.format, "unknown");
@@ -121,6 +126,7 @@ fn utf16le_strings_are_extracted() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(&buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -140,6 +146,7 @@ fn dedupe_drops_repeats() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let opts_drop = ExtractOptions {
         dedupe: true,
@@ -176,9 +183,11 @@ fn skip_code_sections_filters_executable_section_strings() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let opts_drop = ExtractOptions {
         skip_code_sections: true,
+        skip_library_strings: false,
         ..opts_keep.clone()
     };
 
@@ -193,6 +202,45 @@ fn skip_code_sections_filters_executable_section_strings() {
     );
 }
 
+/// `skip_library_strings` drops static strings matching the
+/// curated CRT / libc / Windows-API list. Verify a known library
+/// name is dropped while a non-library string is preserved.
+#[test]
+fn skip_library_strings_filters_curated_set() {
+    // "kernel32.dll" is in the library list; "myprogram.exe" is not.
+    let buf = b"\x00kernel32.dll\x00myprogram.exe\x00";
+
+    let opts_keep = ExtractOptions {
+        min_length: 4,
+        enabled: Some(vec![StringKind::StaticAscii]),
+        format_override: Some(FormatHint::Sc64),
+        max_emulation_steps: 0,
+        dedupe: false,
+        skip_code_sections: false,
+        skip_library_strings: false,
+    };
+    let opts_drop = ExtractOptions {
+        skip_library_strings: true,
+        ..opts_keep.clone()
+    };
+
+    let kept = extract(buf, &opts_keep).expect("extract");
+    let dropped = extract(buf, &opts_drop).expect("extract");
+
+    assert!(kept.strings.iter().any(|s| s.value == "kernel32.dll"));
+    assert!(kept.strings.iter().any(|s| s.value == "myprogram.exe"));
+    assert!(
+        dropped.strings.iter().all(|s| s.value != "kernel32.dll"),
+        "skip_library_strings should drop kernel32.dll, got {:?}",
+        dropped.strings
+    );
+    assert!(
+        dropped.strings.iter().any(|s| s.value == "myprogram.exe"),
+        "non-library string should survive, got {:?}",
+        dropped.strings
+    );
+}
+
 #[test]
 fn empty_input_returns_empty_result() {
     let opts = ExtractOptions {
@@ -202,6 +250,7 @@ fn empty_input_returns_empty_result() {
         max_emulation_steps: 0,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(b"", &opts).expect("extract");
     assert!(result.strings.is_empty());
@@ -252,6 +301,7 @@ fn end_to_end_decoded_extraction_via_public_api() {
         max_emulation_steps: 10_000,
         dedupe: false,
         skip_code_sections: false,
+        skip_library_strings: false,
     };
     let result = extract(&code, &opts).expect("extract must not error");
 

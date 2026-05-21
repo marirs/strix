@@ -47,11 +47,11 @@
 
 #![allow(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
-use crate::analyzer::CodeAnalyzer;
+use crate::analyzer::{CodeAnalyzer, Function};
 use strix_format::ParsedInput;
 
 /// A stack string recovered by pattern analysis.
@@ -65,6 +65,11 @@ pub struct RecoveredStackString {
     /// entry (sign-extended; can be negative for downward-growing
     /// stacks).
     pub stack_offset: i64,
+    /// Whether the string was emitted by writes inside a loop body —
+    /// a "tight" string. Computed from the function CFG via natural-
+    /// loop detection over back-edges. False for straight-line
+    /// stack-string builds.
+    pub is_tight: bool,
 }
 
 /// Scan all functions in `parsed` for stack-string patterns.
@@ -73,15 +78,56 @@ pub fn extract(input: &[u8], parsed: &ParsedInput, min_len: usize) -> Vec<Recove
     let funcs = analyzer.discover_all();
     let mut out = Vec::new();
     for (&entry, func) in &funcs {
-        collect_stack_strings_in_function(&analyzer, func, entry, min_len, &mut out);
+        let loop_blocks = detect_loop_bodies(func);
+        collect_stack_strings_in_function(&analyzer, func, entry, &loop_blocks, min_len, &mut out);
     }
     out
 }
 
+/// Identify the set of basic-block start VAs that lie inside a
+/// natural loop in `func`.
+///
+/// A natural loop is induced by a back-edge: an intra-function
+/// successor edge whose target lies at or before the source block's
+/// start. For each such back-edge `source -> target`, every block
+/// whose start VA is in `[target, source.start]` (inclusive) is
+/// considered part of the loop body.
+///
+/// This is a deliberately conservative approximation — it captures
+/// the common cases (counted XOR loops, RC4 inner loops, byte-by-
+/// byte transformers) without the bookkeeping cost of a full
+/// dominator / SCC pass. Irreducible loops and multi-entry loops
+/// are not handled.
+fn detect_loop_bodies(func: &Function) -> BTreeSet<u64> {
+    let mut loop_blocks: BTreeSet<u64> = BTreeSet::new();
+    let block_starts: Vec<u64> = func.blocks.keys().copied().collect();
+    for (&source_start, block) in &func.blocks {
+        for &succ in &block.successors {
+            // Back-edge: successor jumps to or before this block's start.
+            if succ > source_start {
+                continue;
+            }
+            if !func.blocks.contains_key(&succ) {
+                continue;
+            }
+            // Every block whose start is in [succ, source_start] is
+            // a loop-body block — including the loop header (`succ`)
+            // and the back-edge's source itself.
+            for &b in &block_starts {
+                if b >= succ && b <= source_start {
+                    loop_blocks.insert(b);
+                }
+            }
+        }
+    }
+    loop_blocks
+}
+
 fn collect_stack_strings_in_function(
     analyzer: &CodeAnalyzer<'_>,
-    func: &crate::analyzer::Function,
+    func: &Function,
     func_entry: u64,
+    loop_blocks: &BTreeSet<u64>,
     min_len: usize,
     out: &mut Vec<RecoveredStackString>,
 ) {
@@ -193,8 +239,11 @@ fn collect_stack_strings_in_function(
             }
         }
 
-        // Flush whatever the block left on its virtual stack.
-        flush_runs(&stack, func_entry, min_len, out);
+        // Flush whatever the block left on its virtual stack. Mark
+        // emitted strings as tight if the writing block is inside a
+        // detected loop body.
+        let is_tight = loop_blocks.contains(&block.start);
+        flush_runs(&stack, func_entry, is_tight, min_len, out);
     }
 }
 
@@ -364,6 +413,7 @@ fn canon_reg(reg: Register) -> Register {
 fn flush_runs(
     stack: &BTreeMap<i64, u8>,
     func_entry: u64,
+    is_tight: bool,
     min_len: usize,
     out: &mut Vec<RecoveredStackString>,
 ) {
@@ -376,6 +426,7 @@ fn flush_runs(
                     value: s,
                     function_va: func_entry,
                     stack_offset: start,
+                    is_tight,
                 });
             }
         }
@@ -609,6 +660,63 @@ mod tests {
             recovered.iter().any(|s| s.value == "Invalid data"),
             "expected 'Invalid data', got {:?}",
             recovered
+        );
+    }
+
+    /// A stack string emitted from inside a self-loop (the block
+    /// has a back-edge to itself) should be classified as tight.
+    /// Straight-line stack strings should NOT be tight.
+    #[test]
+    fn tight_classification_marks_loop_body_strings() {
+        // Loop block, single basic block ending in a conditional
+        // back-edge to itself:
+        //   mov byte [rsp+0], 'L'   ; C6 04 24 4C
+        //   mov byte [rsp+1], 'O'   ; C6 44 24 01 4F
+        //   mov byte [rsp+2], 'O'   ; C6 44 24 02 4F
+        //   mov byte [rsp+3], 'P'   ; C6 44 24 03 50
+        //   test eax, eax           ; 85 C0
+        //   jne -23                 ; 75 E9  (back to start)
+        //   ret                     ; C3
+        let code: Vec<u8> = vec![
+            0xC6, 0x04, 0x24, 0x4C, // mov byte [rsp+0], 'L'
+            0xC6, 0x44, 0x24, 0x01, 0x4F, // mov byte [rsp+1], 'O'
+            0xC6, 0x44, 0x24, 0x02, 0x4F, // mov byte [rsp+2], 'O'
+            0xC6, 0x44, 0x24, 0x03, 0x50, // mov byte [rsp+3], 'P'
+            0x85, 0xC0, // test eax, eax
+            0x75, 0xE9, // jne -23
+            0xC3, // ret
+        ];
+        let parsed = parsed_for(&code, 0x8000);
+        let recovered = extract(&code, &parsed, 4);
+        let loop_str = recovered
+            .iter()
+            .find(|s| s.value == "LOOP")
+            .expect("expected LOOP in recovered stack strings");
+        assert!(
+            loop_str.is_tight,
+            "LOOP should be classified as tight (block has a back-edge)"
+        );
+    }
+
+    /// A straight-line stack string (no back-edges anywhere) must
+    /// NOT be classified as tight.
+    #[test]
+    fn tight_classification_skips_straight_line_strings() {
+        // From recovers_stack_string_via_byte_imm — purely linear flow.
+        let code: Vec<u8> = vec![
+            0x48, 0x83, 0xEC, 0x08, 0xC6, 0x04, 0x24, 0x53, 0xC6, 0x44, 0x24, 0x01, 0x54, 0xC6,
+            0x44, 0x24, 0x02, 0x41, 0xC6, 0x44, 0x24, 0x03, 0x43, 0xC6, 0x44, 0x24, 0x04, 0x4B,
+            0x48, 0x83, 0xC4, 0x08, 0xC3,
+        ];
+        let parsed = parsed_for(&code, 0x9000);
+        let recovered = extract(&code, &parsed, 4);
+        let stack_str = recovered
+            .iter()
+            .find(|s| s.value == "STACK")
+            .expect("expected STACK in recovered stack strings");
+        assert!(
+            !stack_str.is_tight,
+            "STACK is straight-line; should not be tight"
         );
     }
 

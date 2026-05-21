@@ -46,8 +46,11 @@ pub struct EmulationResults<'a> {
     pub decoded: Vec<ExtractedString<'a>>,
     /// Strings recovered from the emulated stack.
     pub stack: Vec<ExtractedString<'a>>,
-    /// Tight-string subset of stack strings — not yet classified
-    /// separately; reserved for future loop-correlated detection.
+    /// Tight strings: stack-string builds whose writing block lies
+    /// inside a natural loop body (back-edge detected in the CFG).
+    /// Populated by the pattern-based pass; emulated stack writes
+    /// are not yet correlated to their dominating block and still
+    /// land in `stack`.
     pub tight: Vec<ExtractedString<'a>>,
     /// Non-fatal observations from the run.
     pub warnings: Vec<String>,
@@ -91,16 +94,38 @@ pub fn extract_emulated<'a>(
     // Pattern-based stack-string recovery: pure disassembly, no
     // emulation required. Runs whether or not the `unicorn` feature
     // is on, so callers always get something for the stack bucket.
-    if want.1 {
+    // Strings emitted from inside a loop body are classified as
+    // `Tight`; straight-line builds stay `Stack`.
+    if want.1 || want.2 {
         for rec in stack_strings::extract(input, parsed, options.min_length) {
-            out.stack.push(ExtractedString {
+            let (kind, section_tag) = if rec.is_tight {
+                (StringKind::Tight, "stack-tight")
+            } else {
+                (StringKind::Stack, "stack")
+            };
+            // Honor the want flags: a Tight string only goes out if
+            // tight is enabled; a Stack string only if stack is.
+            let keep = match kind {
+                StringKind::Tight => want.2,
+                StringKind::Stack => want.1,
+                _ => false,
+            };
+            if !keep {
+                continue;
+            }
+            let bucket = if kind == StringKind::Tight {
+                &mut out.tight
+            } else {
+                &mut out.stack
+            };
+            bucket.push(ExtractedString {
                 value: Cow::Owned(rec.value),
-                kind: StringKind::Stack,
+                kind,
                 encoding: Encoding::Ascii,
                 location: Location {
                     offset: 0,
                     address: Some(rec.function_va),
-                    section: Some("stack".to_string()),
+                    section: Some(section_tag.to_string()),
                 },
             });
         }
@@ -394,17 +419,7 @@ fn run_emulated_pipeline<'a>(
         ));
     }
 
-    if want_tight {
-        // Tight strings are stack strings built inside a tight inner
-        // loop. We don't yet correlate writes with their dominating
-        // basic block, so we can't distinguish them from regular
-        // stack strings. Flag and move on.
-        out.warnings.push(
-            "tight-string classification not yet implemented; tight \
-             strings (if any) appear in the stack-strings list"
-                .to_string(),
-        );
-    }
+    let _ = want_tight; // tight is classified by the pattern pass above
 
     Ok(())
 }

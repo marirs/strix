@@ -121,6 +121,14 @@ struct Cli {
     /// `[A\\A]A^A_]`, etc.) on typical binaries.
     #[arg(long)]
     no_code: bool,
+
+    /// Drop static strings that match a curated list of common
+    /// CRT / libc / Windows-API boilerplate (DLL filenames,
+    /// imported function names, statically-linked runtime error
+    /// messages). Useful for triage workflows where you want to
+    /// see program strings, not runtime noise.
+    #[arg(long, alias = "no-library-strings")]
+    no_library: bool,
 }
 
 fn main() -> Result<()> {
@@ -169,6 +177,7 @@ fn main() -> Result<()> {
         max_emulation_steps: 20_000,
         dedupe: cli.dedupe,
         skip_code_sections: cli.no_code,
+        skip_library_strings: cli.no_library,
     };
 
     let result = strix::extract(bytes, &options)?;

@@ -68,8 +68,12 @@ strix --dedupe malware.exe
 # (eliminates most assembly-byte false positives like AWAVAUATSH)
 strix --no-code malware.exe
 
+# Drop CRT / libc / Windows-API boilerplate noise
+# (kernel32.dll, GetProcAddress, "Runtime Error!", ...)
+strix --no-library malware.exe
+
 # Combine: typical analyst usage
-strix --dedupe --no-code malware.exe
+strix --dedupe --no-code --no-library malware.exe
 
 # Only run specific extractor groups
 strix --only static malware.exe
@@ -179,6 +183,7 @@ let opts = ExtractOptions {
     max_emulation_steps: 20_000,         // cap per emulated function
     dedupe: true,                        // drop duplicate (value, kind, encoding)
     skip_code_sections: true,            // drop static strings in .text / __TEXT,__text
+    skip_library_strings: true,          // drop CRT/libc/Windows-API noise
 };
 
 let bytes = std::fs::read("malware.exe")?;

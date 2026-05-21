@@ -14,9 +14,11 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 pub mod error;
+pub mod library;
 pub mod traits;
 
 pub use error::{Error, Result};
+pub use library::is_library_string;
 pub use traits::Extractor;
 
 /// The kind of string that was extracted.
@@ -160,6 +162,13 @@ pub struct ExtractOptions {
     /// push r12; push rbx; push rax` encoded) that scanners always
     /// pick up in `.text` / `__TEXT,__text`. Default `false`.
     pub skip_code_sections: bool,
+    /// If true, drop static strings that match a curated list of
+    /// well-known CRT / libc / Windows-API boilerplate (see
+    /// [`crate::library::LIBRARY_STRINGS`]). Useful for triage
+    /// workflows where the analyst wants to see program strings, not
+    /// the noise from statically-linked runtime libraries. Default
+    /// `false`.
+    pub skip_library_strings: bool,
 }
 
 impl Default for ExtractOptions {
@@ -171,6 +180,7 @@ impl Default for ExtractOptions {
             max_emulation_steps: 20_000,
             dedupe: false,
             skip_code_sections: false,
+            skip_library_strings: false,
         }
     }
 }
