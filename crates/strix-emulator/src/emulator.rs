@@ -269,6 +269,7 @@ mod tests {
             warnings: Vec::new(),
             scan_window: None,
             imports: Vec::new(),
+            symbols: Default::default(),
         };
 
         let mut emu = CpuEmulator::from_parsed(&bytes, &parsed).expect("from_parsed");

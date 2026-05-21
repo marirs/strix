@@ -78,6 +78,7 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
                     warnings: Vec::new(),
                     scan_window: None,
                     imports: Vec::new(),
+                    symbols: Default::default(),
                 }),
                 Some("input not recognized as PE/ELF/Mach-O; running over raw bytes".to_string()),
             )

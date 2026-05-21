@@ -619,6 +619,7 @@ mod tests {
             warnings: Vec::new(),
             scan_window: None,
             imports: Vec::new(),
+            symbols: Default::default(),
         }
     }
 
@@ -784,6 +785,7 @@ mod tests {
                 name: "VirtualAlloc".to_string(),
                 iat_va: IAT_VA,
             }],
+            symbols: Default::default(),
         };
         let analyzer = CodeAnalyzer::new(&code, &parsed);
         let f = analyzer.analyze_function(TEXT_VA).expect("function");

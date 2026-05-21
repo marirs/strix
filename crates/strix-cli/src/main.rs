@@ -144,6 +144,15 @@ struct Cli {
     /// for tracking which decoder routine produced which strings.
     #[arg(long)]
     by_function: bool,
+
+    /// Briefer human-readable output: show only the emulation-
+    /// recovered sections (decoded / stack / tight) and the
+    /// decoder-candidate summary, suppressing static and language
+    /// strings entirely. The high-signal output for malware triage,
+    /// without thousands of CRT noise strings between you and the
+    /// decoded payload.
+    #[arg(long)]
+    brief: bool,
 }
 
 fn main() -> Result<()> {
@@ -217,7 +226,7 @@ fn main() -> Result<()> {
         }
         writeln!(out)?;
     } else {
-        print_human(&result, &mut out, cli.quiet, cli.by_function)?;
+        print_human(&result, &mut out, cli.quiet, cli.by_function, cli.brief)?;
     }
     out.flush()?;
     Ok(())
@@ -230,11 +239,15 @@ fn main() -> Result<()> {
 /// strings are sorted by address (if known) else by file offset.
 /// When `by_function` is true, emulation-recovered sections
 /// (decoded / stack / tight) are sub-grouped by source function VA.
+/// When `brief` is true, only the emulation-recovered sections plus
+/// the decoder-candidate summary are printed; static and language
+/// strings are dropped.
 fn print_human(
     result: &ExtractionResult<'_>,
     out: &mut dyn Write,
     quiet: bool,
     by_function: bool,
+    brief: bool,
 ) -> io::Result<()> {
     let groups = group_strings(&result.strings);
     let order = [
@@ -274,8 +287,38 @@ fn print_human(
     // file offsets, not functions, so grouping them by VA is
     // meaningless.
     let function_grouped = [StringKind::Decoded, StringKind::Stack, StringKind::Tight];
+    // In brief mode, drop the static / language sections entirely
+    // and lead with a candidate summary so the analyst sees the
+    // decoder ranking before the actual decoded strings.
+    if brief && !quiet && !result.candidates.is_empty() {
+        writeln!(
+            out,
+            "=== decoder candidates ({}) ===",
+            result.candidates.len()
+        )?;
+        for c in &result.candidates {
+            let name = c.name.as_deref().unwrap_or("");
+            let tags = if c.tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", c.tags.join(", "))
+            };
+            writeln!(
+                out,
+                "  {va:#018x}  score={score:.2}  recovered={rec}  {name}{tags}",
+                va = c.va,
+                score = c.score,
+                rec = c.recovered_strings,
+            )?;
+        }
+        writeln!(out)?;
+    }
 
     for (label, kinds) in order.iter() {
+        // In brief mode, skip the static / language sections.
+        if brief && !kinds.iter().any(|k| function_grouped.contains(k)) {
+            continue;
+        }
         let mut combined: Vec<&ExtractedString<'_>> = kinds
             .iter()
             .flat_map(|k| {
@@ -299,13 +342,36 @@ fn print_human(
         // asked.
         let section_is_emul = kinds.iter().any(|k| function_grouped.contains(k));
         if by_function && section_is_emul {
+            // Build a function VA -> (name, tags) lookup from the
+            // candidates list so we can decorate each subheading.
+            let mut meta_by_va: BTreeMap<u64, (Option<String>, Vec<String>)> = BTreeMap::new();
+            for c in &result.candidates {
+                meta_by_va.insert(c.va, (c.name.clone(), c.tags.clone()));
+            }
             let mut by_va: BTreeMap<u64, Vec<&ExtractedString<'_>>> = BTreeMap::new();
             for s in combined {
-                let va = s.location.address.unwrap_or(0);
+                let va = s
+                    .location
+                    .function_va
+                    .unwrap_or_else(|| s.location.address.unwrap_or(0));
                 by_va.entry(va).or_default().push(s);
             }
             for (va, items) in &by_va {
-                writeln!(out, "  function {:#018x}  ({} strings)", va, items.len())?;
+                let (name, tags) = meta_by_va.get(va).cloned().unwrap_or((None, Vec::new()));
+                let name_part = name
+                    .as_deref()
+                    .map(|n| format!("  {n}"))
+                    .unwrap_or_default();
+                let tags_part = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", tags.join(", "))
+                };
+                writeln!(
+                    out,
+                    "  function {va:#018x}{name_part}{tags_part}  ({} strings)",
+                    items.len()
+                )?;
                 for s in items {
                     writeln!(out, "    {}", s.value)?;
                 }

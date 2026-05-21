@@ -1299,6 +1299,7 @@ mod tests {
             warnings: Vec::new(),
             scan_window: None,
             imports: Vec::new(),
+            symbols: Default::default(),
         }
     }
 

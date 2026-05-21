@@ -597,6 +597,7 @@ fn run_emulated_pipeline<'a>(
             };
             DecoderCandidate {
                 va: *va,
+                name: parsed.symbols.get(va).cloned(),
                 score: score.score,
                 bitwise_density: score.components.bitwise_density,
                 loop_count: score.components.loop_count,

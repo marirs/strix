@@ -72,6 +72,13 @@ pub struct ParsedInput {
     /// work on heap-allocated buffers can still write into emulated
     /// memory we can read back.
     pub imports: Vec<Import>,
+    /// Map of function virtual address to its symbol name, when
+    /// the binary still carries a symbol table. Populated from PE
+    /// exports, ELF `.symtab` / `.dynsym`, and Mach-O `LC_SYMTAB`.
+    /// Empty for stripped binaries. The emulator pipeline uses
+    /// this to tag decoder candidates with their real function
+    /// names in the JSON output.
+    pub symbols: std::collections::BTreeMap<u64, String>,
 }
 
 /// An external function the binary imports from a shared library.
@@ -141,6 +148,16 @@ fn parse_pe(input: &[u8]) -> Result<ParsedInput> {
             iat_va: image_base + i.rva as u64,
         })
         .collect();
+    // Build symbols map from the PE export table. PE binaries can
+    // also carry a COFF symbol table for internal symbols, but
+    // it's almost always stripped in shipping software; exports
+    // give us the names that survive.
+    let mut symbols: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    for export in &pe.exports {
+        if let Some(name) = export.name {
+            symbols.insert(image_base + export.rva as u64, name.to_string());
+        }
+    }
     let sections = pe
         .sections
         .iter()
@@ -174,6 +191,7 @@ fn parse_pe(input: &[u8]) -> Result<ParsedInput> {
         warnings: Vec::new(),
         scan_window: None,
         imports,
+        symbols,
     })
 }
 
@@ -252,6 +270,37 @@ fn parse_elf(input: &[u8]) -> Result<ParsedInput> {
         }
     }
 
+    // Symbols: walk both `.symtab` (full debug info, stripped in
+    // many release binaries) and `.dynsym` (the dynamic linker's
+    // table, usually preserved). Only keep entries with a real
+    // name and a function-ish type.
+    let mut symbols: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let st_type_func = |st_info: u8| (st_info & 0xf) == 2; // STT_FUNC
+    for sym in elf.syms.iter() {
+        if !st_type_func(sym.st_info) {
+            continue;
+        }
+        let name = match elf.strtab.get_at(sym.st_name) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        if sym.st_value != 0 {
+            symbols.entry(sym.st_value).or_insert(name);
+        }
+    }
+    for sym in elf.dynsyms.iter() {
+        if !st_type_func(sym.st_info) {
+            continue;
+        }
+        let name = match elf.dynstrtab.get_at(sym.st_name) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        if sym.st_value != 0 {
+            symbols.entry(sym.st_value).or_insert(name);
+        }
+    }
+
     Ok(ParsedInput {
         metadata: InputMetadata {
             format: "elf".to_string(),
@@ -265,6 +314,7 @@ fn parse_elf(input: &[u8]) -> Result<ParsedInput> {
         warnings: Vec::new(),
         scan_window: None,
         imports,
+        symbols,
     })
 }
 
@@ -383,6 +433,21 @@ fn parse_macho(input: &[u8]) -> Result<ParsedInput> {
         }
     }
 
+    // Symbols from LC_SYMTAB. mo.symbols() yields each (name,
+    // Nlist) — keep entries with a non-empty name and a non-zero
+    // n_value. Mach-O symbol names typically have a leading
+    // underscore (`_main`, `_decode_rc4`); strip it for
+    // consistency with PE/ELF naming.
+    let mut symbols: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    if let Some(syms) = mo.symbols.as_ref() {
+        for (name, nlist) in syms.iter().flatten() {
+            if !name.is_empty() && nlist.n_value != 0 {
+                let clean = name.strip_prefix('_').unwrap_or(name).to_string();
+                symbols.entry(nlist.n_value).or_insert(clean);
+            }
+        }
+    }
+
     Ok(ParsedInput {
         metadata: InputMetadata {
             format: "macho".to_string(),
@@ -396,6 +461,7 @@ fn parse_macho(input: &[u8]) -> Result<ParsedInput> {
         warnings,
         scan_window,
         imports,
+        symbols,
     })
 }
 
@@ -444,6 +510,7 @@ fn parse_shellcode(input: &[u8], bits: u8) -> ParsedInput {
         warnings: Vec::new(),
         scan_window: None,
         imports: Vec::new(),
+        symbols: Default::default(),
     }
 }
 

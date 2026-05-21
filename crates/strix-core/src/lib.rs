@@ -273,6 +273,11 @@ pub struct InputMetadata {
 pub struct DecoderCandidate {
     /// Virtual address of the function entry.
     pub va: u64,
+    /// Symbol name for the function, when the binary still carries
+    /// a symbol table. `None` for stripped binaries. Lets analysts
+    /// see `decode_rc4 at 0x4015a0` instead of a bare VA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Composite decoder-likeness score in `[0, 1]`.
     pub score: f64,
     /// Fraction of instructions that were bitwise / arithmetic.

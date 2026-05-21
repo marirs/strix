@@ -1,14 +1,28 @@
-//! Rust string extraction.
+//! Rust string and symbol extraction.
 //!
-//! Like Go, Rust strings are not NUL-terminated. We extract UTF-8
-//! runs from read-only data sections and uses code-reference analysis
-//! to split adjacent strings.
+//! Rust binaries don't have a single tidy function-name table like
+//! Go's pclntab — they rely on the dynamic / debug symbol tables
+//! the linker emits. We extract Rust-flavored content from three
+//! sources:
 //!
-//! This initial implementation does the UTF-8 run extraction without
-//! the xref-driven splitting; it will be replaced once the analyzer
-//! in `strix-emulator` is online.
+//! 1. **UTF-8 runs in `.rodata` / `__rodata`.** Catches string
+//!    literals, panic strings, `#[derive(Debug)]` output, format
+//!    strings.
+//! 2. **The `.rustc` section's compressed-bytecode header.**
+//!    Older Rust releases used `RUST_CRATE` magic bytes followed
+//!    by a snappy-compressed crate metadata blob; modern releases
+//!    write an LLVM `__LLVM_BITCODE` style `RUSTC` magic. We surface
+//!    the magic + version string as a Rust-kind output entry so
+//!    analysts can confirm the toolchain version.
+//! 3. **Rust-mangled symbols.** Both legacy (`_ZN`) and v0
+//!    (`_R`) Rust mangling produce path-like names that survive
+//!    in the binary's symbol table (populated by strix-format).
+//!    We emit each that looks Rust-mangled as a `Rust`-kind string
+//!    so the analyst sees `core::option::Option::unwrap` etc.
 
-use strix_core::{ExtractOptions, ExtractedString, Result, StringKind};
+use std::borrow::Cow;
+
+use strix_core::{Encoding, ExtractOptions, ExtractedString, Location, Result, StringKind};
 use strix_format::ParsedInput;
 
 const RUST_RODATA_SECTIONS: &[&str] = &[
@@ -20,12 +34,15 @@ const RUST_RODATA_SECTIONS: &[&str] = &[
     "__TEXT,__cstring",
 ];
 
+const RUST_METADATA_SECTIONS: &[&str] = &[".rustc", "__rustc", "__DATA_CONST,__rustc"];
+
 pub(crate) fn extract<'a>(
     input: &'a [u8],
     parsed: &ParsedInput,
     options: &ExtractOptions,
     out: &mut Vec<ExtractedString<'a>>,
 ) -> Result<()> {
+    // Rodata UTF-8 sweep.
     for section in &parsed.sections {
         if RUST_RODATA_SECTIONS
             .iter()
@@ -34,5 +51,123 @@ pub(crate) fn extract<'a>(
             super::extract_utf8_runs(input, section, options.min_length, StringKind::Rust, out);
         }
     }
+
+    // .rustc metadata header — surface the rustc version string if
+    // we can find one. The metadata blob is compressed, so we don't
+    // try to decode the whole thing here.
+    for section in &parsed.sections {
+        if RUST_METADATA_SECTIONS
+            .iter()
+            .any(|s| section.name.contains(s))
+        {
+            extract_rustc_metadata(input, section, options, out);
+        }
+    }
+
+    // Rust-mangled symbol names. The symbol table was populated by
+    // strix-format's PE/ELF/Mach-O parsers — we just filter.
+    for (&va, name) in &parsed.symbols {
+        if is_rust_mangled(name) && name.len() >= options.min_length {
+            out.push(ExtractedString {
+                value: Cow::Owned(name.clone()),
+                kind: StringKind::Rust,
+                encoding: Encoding::Utf8,
+                location: Location {
+                    offset: 0,
+                    address: Some(va),
+                    section: None,
+                    function_va: Some(va),
+                    source_va: None,
+                },
+            });
+        }
+    }
+
     Ok(())
+}
+
+/// Pull the rustc-version stamp out of a `.rustc` section header.
+/// The .rustc section starts with an 8-byte magic plus a 4-byte
+/// version, then a length-prefixed UTF-8 rustc identifier like
+/// `rustc 1.78.0 (9b00956e5 2024-04-29)`.
+fn extract_rustc_metadata<'a>(
+    input: &'a [u8],
+    section: &strix_format::Section,
+    options: &ExtractOptions,
+    out: &mut Vec<ExtractedString<'a>>,
+) {
+    let start = section.file_offset as usize;
+    let end = (section.file_offset + section.file_size) as usize;
+    if start >= input.len() || end > input.len() {
+        return;
+    }
+    let bytes = &input[start..end];
+    // The header layout is "rustc xxx" buried after a short magic
+    // prefix. Rather than tracking the exact layout (which has
+    // changed over time), scan the first 256 bytes for a "rustc "
+    // prefix and emit the run that starts there.
+    let look = &bytes[..bytes.len().min(256)];
+    if let Some(pos) = find_subsequence(look, b"rustc ") {
+        let run_start = pos;
+        let mut run_end = pos;
+        while run_end < look.len() && look[run_end] >= 0x20 && look[run_end] < 0x7f {
+            run_end += 1;
+        }
+        if run_end - run_start >= options.min_length
+            && let Ok(s) = std::str::from_utf8(&look[run_start..run_end])
+        {
+            let abs = start + run_start;
+            let borrowed: &'a str =
+                unsafe { std::str::from_utf8_unchecked(&input[abs..abs + s.len()]) };
+            out.push(ExtractedString {
+                value: Cow::Borrowed(borrowed),
+                kind: StringKind::Rust,
+                encoding: Encoding::Utf8,
+                location: Location {
+                    offset: abs as u64,
+                    address: section.offset_to_va(abs as u64),
+                    section: Some(section.name.clone()),
+                    function_va: None,
+                    source_va: None,
+                },
+            });
+        }
+    }
+}
+
+/// Recognize the two Rust symbol-mangling schemes:
+///   * Legacy (Itanium-ABI-style): `_ZN...E` — name decomposes into
+///     length-prefixed path components.
+///   * v0 (RFC 2603): `_R...` — leading `_R` with a base64-ish
+///     payload.
+///
+/// We accept either as Rust-flavored when the rest of the symbol
+/// looks well-formed enough to not be a C++ name. The legacy scheme
+/// is shared with C++ (Itanium ABI), so we additionally require the
+/// presence of a Rust-specific path token like `core::`, `std::`,
+/// `alloc::`, or `..` to keep the false-positive rate down.
+fn is_rust_mangled(name: &str) -> bool {
+    if name.starts_with("_R") {
+        // v0 mangling is Rust-only.
+        return name.len() > 4
+            && name
+                .bytes()
+                .skip(2)
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$');
+    }
+    if name.starts_with("_ZN") && name.ends_with('E') {
+        // Legacy scheme. Require a Rust-typical path token to
+        // distinguish from C++.
+        return name.contains("$LT$")
+            || name.contains("4core")
+            || name.contains("3std")
+            || name.contains("5alloc")
+            || name.contains("11collections")
+            || name.contains("17h"); // legacy disambiguator suffix
+    }
+    false
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
