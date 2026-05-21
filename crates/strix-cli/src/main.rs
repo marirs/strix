@@ -127,7 +127,7 @@ struct Cli {
     /// imported function names, statically-linked runtime error
     /// messages). Useful for triage workflows where you want to
     /// see program strings, not runtime noise.
-    #[arg(long, alias = "no-library-strings")]
+    #[arg(long)]
     no_library: bool,
 }
 
