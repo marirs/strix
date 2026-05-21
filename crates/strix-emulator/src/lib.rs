@@ -147,7 +147,7 @@ pub fn extract_emulated<'a>(
                     .to_string(),
             );
         }
-        return Ok(out);
+        Ok(out)
     }
 
     #[cfg(feature = "unicorn")]

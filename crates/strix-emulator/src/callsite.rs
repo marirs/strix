@@ -310,10 +310,10 @@ fn sweep_block_range(
     let dec_bytes = &block_bytes[..len];
     let decoder = Decoder::with_ip(analyzer.bitness(), dec_bytes, start, DecoderOptions::NONE);
     for insn in decoder {
-        if let Some(stop) = stop_at {
-            if insn.ip() == stop {
-                return;
-            }
+        if let Some(stop) = stop_at
+            && insn.ip() == stop
+        {
+            return;
         }
         apply_effect(state, &insn, bytes_for_va);
     }
@@ -363,12 +363,11 @@ fn merge_states(states: &[RegState]) -> RegState {
                 }
             }
         }
-        if all_match {
-            if let Some(v) = agreed {
-                if !matches!(v, AbsVal::Unknown) {
-                    out.vals.insert(r, v);
-                }
-            }
+        if all_match
+            && let Some(v) = agreed
+            && !matches!(v, AbsVal::Unknown)
+        {
+            out.vals.insert(r, v);
         }
     }
     out
@@ -741,20 +740,17 @@ fn handle_mov(
             if insn.is_ip_rel_memory_operand() {
                 let va = insn.ip_rel_memory_address();
                 let size = insn.memory_size().info().size().min(8);
-                if let Some(bytes) = bytes_for_va(va, size) {
-                    if bytes.len() == size && size > 0 {
-                        let mut buf = [0u8; 8];
-                        buf[..size].copy_from_slice(&bytes);
-                        return state.set(dst, AbsVal::Concrete(u64::from_le_bytes(buf)));
-                    }
+                if let Some(bytes) = bytes_for_va(va, size)
+                    && bytes.len() == size
+                    && size > 0
+                {
+                    let mut buf = [0u8; 8];
+                    buf[..size].copy_from_slice(&bytes);
+                    return state.set(dst, AbsVal::Concrete(u64::from_le_bytes(buf)));
                 }
                 None
-            } else if let Some(key) = slot_key_for_memory(insn) {
-                // Stack-slot reload: forward whatever we tracked at
-                // that cell (or Unknown if we never saw a store).
-                Some(state.load_slot(key))
             } else {
-                None
+                slot_key_for_memory(insn).map(|key| state.load_slot(key))
             }
         }
         _ => None,

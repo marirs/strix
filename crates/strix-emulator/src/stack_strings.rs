@@ -169,8 +169,8 @@ fn collect_stack_strings_in_function(
                     let reg = canon_reg(insn.op0_register());
                     if let Some(bytes) = reg_imms.get(&reg).cloned() {
                         let n = bytes.len().min(ptr_size as usize);
-                        for i in 0..n {
-                            stack.insert(vrsp + i as i64, bytes[i]);
+                        for (i, &b) in bytes.iter().take(n).enumerate() {
+                            stack.insert(vrsp + i as i64, b);
                         }
                     }
                 }
@@ -255,8 +255,8 @@ fn push_immediate_bytes(insn: &Instruction, ptr_size: usize) -> Option<Vec<u8>> 
     }
     let raw = match insn.op0_kind() {
         OpKind::Immediate8 => vec![insn.immediate8()],
-        OpKind::Immediate8to16 => (insn.immediate8to16() as i16 as u16).to_le_bytes().to_vec(),
-        OpKind::Immediate8to32 => (insn.immediate8to32() as i32 as u32).to_le_bytes().to_vec(),
+        OpKind::Immediate8to16 => (insn.immediate8to16() as u16).to_le_bytes().to_vec(),
+        OpKind::Immediate8to32 => (insn.immediate8to32() as u32).to_le_bytes().to_vec(),
         OpKind::Immediate8to64 => (insn.immediate8to64() as u64).to_le_bytes().to_vec(),
         OpKind::Immediate16 => insn.immediate16().to_le_bytes().to_vec(),
         OpKind::Immediate32 | OpKind::Immediate32to64 => insn.immediate32().to_le_bytes().to_vec(),
@@ -324,11 +324,11 @@ fn immediate_to_register(insn: &Instruction) -> Option<(Register, Vec<u8>)> {
         }
         OpKind::Immediate64 => Some((dst, insn.immediate64().to_le_bytes().to_vec())),
         OpKind::Immediate8to16 => {
-            let v = insn.immediate8to16() as i16;
+            let v = insn.immediate8to16();
             Some((dst, (v as u16).to_le_bytes().to_vec()))
         }
         OpKind::Immediate8to32 => {
-            let v = insn.immediate8to32() as i32;
+            let v = insn.immediate8to32();
             Some((dst, (v as u32).to_le_bytes().to_vec()))
         }
         OpKind::Immediate8to64 => {
@@ -420,28 +420,29 @@ fn flush_runs(
     let mut current: Option<(i64, String)> = None;
     let mut prev_off: Option<i64> = None;
     let emit = |cur: Option<(i64, String)>, out: &mut Vec<RecoveredStackString>| {
-        if let Some((start, s)) = cur {
-            if s.len() >= min_len {
-                out.push(RecoveredStackString {
-                    value: s,
-                    function_va: func_entry,
-                    stack_offset: start,
-                    is_tight,
-                });
-            }
+        if let Some((start, s)) = cur
+            && s.len() >= min_len
+        {
+            out.push(RecoveredStackString {
+                value: s,
+                function_va: func_entry,
+                stack_offset: start,
+                is_tight,
+            });
         }
     };
     for (&off, &byte) in stack {
         let printable = is_printable(byte);
-        let contiguous = prev_off.map_or(false, |p| off == p + 1);
-        if printable && contiguous && current.is_some() {
-            current.as_mut().unwrap().1.push(byte as char);
-        } else {
-            emit(current.take(), out);
-            if printable {
-                let mut s = String::new();
-                s.push(byte as char);
-                current = Some((off, s));
+        let contiguous = prev_off.is_some_and(|p| off == p + 1);
+        match (&mut current, printable && contiguous) {
+            (Some((_, s)), true) => s.push(byte as char),
+            _ => {
+                emit(current.take(), out);
+                if printable {
+                    let mut s = String::new();
+                    s.push(byte as char);
+                    current = Some((off, s));
+                }
             }
         }
         prev_off = Some(off);
@@ -485,8 +486,8 @@ fn stack_immediate_store(insn: &Instruction) -> Option<(StackBase, i64, Vec<u8>)
         OpKind::Immediate16 => insn.immediate16().to_le_bytes().to_vec(),
         OpKind::Immediate32 | OpKind::Immediate32to64 => insn.immediate32().to_le_bytes().to_vec(),
         OpKind::Immediate64 => insn.immediate64().to_le_bytes().to_vec(),
-        OpKind::Immediate8to16 => (insn.immediate8to16() as i16 as u16).to_le_bytes().to_vec(),
-        OpKind::Immediate8to32 => (insn.immediate8to32() as i32 as u32).to_le_bytes().to_vec(),
+        OpKind::Immediate8to16 => (insn.immediate8to16() as u16).to_le_bytes().to_vec(),
+        OpKind::Immediate8to32 => (insn.immediate8to32() as u32).to_le_bytes().to_vec(),
         OpKind::Immediate8to64 => (insn.immediate8to64() as u64).to_le_bytes().to_vec(),
         _ => return None,
     };
