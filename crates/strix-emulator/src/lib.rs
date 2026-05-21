@@ -450,9 +450,13 @@ fn run_emulated_pipeline<'a>(
     // function VA, so they show up here too — which is fine: these
     // ARE the functions the heuristic flagged, regardless of which
     // recovery pass surfaced their strings.
-    let mut counts_by_va: std::collections::BTreeMap<u64, u32> =
-        std::collections::BTreeMap::new();
-    for s in out.decoded.iter().chain(out.stack.iter()).chain(out.tight.iter()) {
+    let mut counts_by_va: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+    for s in out
+        .decoded
+        .iter()
+        .chain(out.stack.iter())
+        .chain(out.tight.iter())
+    {
         if let Some(addr) = s.location.address {
             *counts_by_va.entry(addr).or_insert(0) += 1;
         }

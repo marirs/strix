@@ -255,8 +255,7 @@ fn combine(c: &ScoreComponents, w: ScoreWeights) -> f64 {
     let s_callers = caller_score(c.caller_count);
     let s_import_purity = import_purity_score(c.import_callee_count);
 
-    let total_w =
-        w.w_bitwise + w.w_loops + w.w_size + w.w_callers + w.w_import_purity;
+    let total_w = w.w_bitwise + w.w_loops + w.w_size + w.w_callers + w.w_import_purity;
     if total_w == 0.0 {
         return 0.0;
     }

@@ -342,8 +342,7 @@ fn merge_states(states: &[RegState]) -> RegState {
         return states[0].clone();
     }
     // Collect every register that any state has tracked.
-    let mut all_regs: std::collections::BTreeSet<Register> =
-        std::collections::BTreeSet::new();
+    let mut all_regs: std::collections::BTreeSet<Register> = std::collections::BTreeSet::new();
     for s in states {
         for r in s.vals.keys() {
             all_regs.insert(*r);
