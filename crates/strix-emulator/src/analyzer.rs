@@ -137,6 +137,29 @@ impl<'a> CodeAnalyzer<'a> {
         Some(&self.bytes[start..end])
     }
 
+    /// Read up to `len` bytes from the binary at virtual address
+    /// `va`, regardless of section permissions. Returns `None` when
+    /// `va` isn't in any mapped section.
+    ///
+    /// Used by the stack-string pattern matcher for SIMD-load
+    /// constants like `movdqu xmm, [rip+rdata_disp]` where the
+    /// source bytes live in `.rdata` / `__const`.
+    pub fn data_at_va(&self, va: u64, len: usize) -> Option<&'a [u8]> {
+        for sec in &self.parsed.sections {
+            if va >= sec.virtual_address && va < sec.virtual_address + sec.file_size {
+                let off_in_sec = (va - sec.virtual_address) as usize;
+                let file_off = sec.file_offset as usize + off_in_sec;
+                let avail = (sec.file_size as usize).saturating_sub(off_in_sec);
+                let take = len.min(avail);
+                if file_off + take > self.bytes.len() {
+                    return None;
+                }
+                return Some(&self.bytes[file_off..file_off + take]);
+            }
+        }
+        None
+    }
+
     /// Decode instructions at `va` until the end of the containing
     /// section. Returns `None` if `va` isn't in executable code.
     pub fn instructions_at(&self, va: u64) -> Option<impl Iterator<Item = Instruction> + 'a> {

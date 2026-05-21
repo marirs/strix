@@ -134,6 +134,18 @@ struct HookState {
     /// cap so a wild pointer chase doesn't blow past QEMU's
     /// internal `phys_section_add` limit (4096 sections).
     lazy_pages: HashSet<u64>,
+    /// Per-byte record of (memory_address -> writing_instruction_ip)
+    /// for the current run. Populated by a MEM_WRITE hook and reset
+    /// at the start of every run_function call. Lets the pipeline
+    /// classify recovered stack/scratch strings as "tight" when the
+    /// writing IP lies inside a loop body of the emulated function.
+    mem_writes: HashMap<u64, u64>,
+    /// Current instruction address, updated by a code hook on every
+    /// instruction. The MEM_WRITE hook reads this to attribute the
+    /// write to its writing instruction without calling
+    /// `reg_read(RIP)` on every store (which Unicorn 2.x has
+    /// deprecated and floods stderr with warnings).
+    current_ip: u64,
 }
 
 /// Hard cap on the number of pages the lazy-mapping hook will
@@ -304,6 +316,8 @@ impl EmulationDriver {
             heap_end: layout.heap_base.saturating_add(layout.heap_size),
             heap_base: layout.heap_base,
             lazy_pages: HashSet::new(),
+            mem_writes: HashMap::new(),
+            current_ip: 0,
         }));
 
         // Install a Unicorn code hook over the stub region. Each time
@@ -375,6 +389,54 @@ impl EmulationDriver {
             },
         );
 
+        // Global per-instruction code hook: keep state.current_ip
+        // in sync with the executing instruction so the MEM_WRITE
+        // hook can attribute writes without calling reg_read(RIP)
+        // (which Unicorn 2.x has deprecated and floods stderr
+        // about on every call).
+        let state_for_ip_hook = Arc::clone(&state);
+        let _ = emu
+            .uc
+            .add_code_hook(1, u64::MAX, move |_uc, addr, _size| {
+                if let Ok(mut st) = state_for_ip_hook.lock() {
+                    st.current_ip = addr;
+                }
+            });
+
+        // Memory-write tracking hook. Records the IP of every
+        // store, indexed by destination byte. Used after emulation
+        // to classify recovered stack/scratch strings as tight
+        // (loop-built) vs ordinary stack writes.
+        let state_for_write_hook = Arc::clone(&state);
+        let _ = emu.uc.add_mem_hook(
+            HookType::MEM_WRITE,
+            1,
+            u64::MAX,
+            move |_uc, _mtype, addr, size, _value| {
+                if size == 0 || size > 64 {
+                    // Reject zero-size writes and oversized records
+                    // we'd never get a meaningful classification from
+                    // (the SIMD path tops out at 64-byte ZMM stores).
+                    return true;
+                }
+                if let Ok(mut st) = state_for_write_hook.lock() {
+                    // Cap the map to keep wall-clock bounded on
+                    // long-running emulations. Once we've recorded
+                    // ~32K bytes of writes, additional writes are
+                    // ignored. Real decoders rarely emit more than a
+                    // few hundred bytes; the cap is a safety net.
+                    if st.mem_writes.len() >= 32_768 {
+                        return true;
+                    }
+                    let ip = st.current_ip;
+                    for offset in 0..size as u64 {
+                        st.mem_writes.insert(addr.saturating_add(offset), ip);
+                    }
+                }
+                true
+            },
+        );
+
         // Snapshot writable binary sections so we can restore them
         // between runs. Skip sections that overlap our pre-mapped
         // regions (scratch / heap / stub / stack) — those have
@@ -420,6 +482,36 @@ impl EmulationDriver {
             state,
             writable_snapshot,
         })
+    }
+
+    /// For each recovered string in `recovered`, populate
+    /// `writing_ips` by walking the byte range
+    /// `[address, address + value.len())` and collecting the
+    /// distinct writing IPs the MEM_WRITE hook captured for those
+    /// bytes. Caps the per-string list at 8 IPs to avoid bloating
+    /// the result on long buffers.
+    fn enrich_writing_ips(&self, recovered: &mut [RecoveredString]) {
+        let Ok(st) = self.state.lock() else {
+            return;
+        };
+        for rec in recovered.iter_mut() {
+            let len = rec.value.len();
+            if len == 0 {
+                continue;
+            }
+            let mut ips: Vec<u64> = Vec::new();
+            for off in 0..len as u64 {
+                if let Some(ip) = st.mem_writes.get(&(rec.address + off)) {
+                    if !ips.contains(ip) {
+                        ips.push(*ip);
+                        if ips.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            rec.writing_ips = ips;
+        }
     }
 
     /// Restore each snapshotted writable section to its original
@@ -493,6 +585,8 @@ impl EmulationDriver {
         self.restore_writable_snapshot()?;
         if let Ok(mut st) = self.state.lock() {
             st.heap_ptr = st.heap_base;
+            st.mem_writes.clear();
+            st.current_ip = 0;
         }
         let ptr_size: u64 = if bits == 64 { 8 } else { 4 };
         let stack_top = self.layout.stack_base + self.layout.stack_size - 0x100;
@@ -575,6 +669,7 @@ impl EmulationDriver {
             4,
             &mut recovered,
         );
+        self.enrich_writing_ips(&mut recovered);
         Ok(RunResult {
             recovered,
             execution_ok: execution.is_ok(),
@@ -600,9 +695,11 @@ impl EmulationDriver {
         // on `.data` / `.bss` don't leak across argument-fuzzing
         // variations.
         self.restore_writable_snapshot()?;
-        // Reset heap allocator pointer.
+        // Reset heap allocator pointer + per-run write log.
         if let Ok(mut st) = self.state.lock() {
             st.heap_ptr = st.heap_base;
+            st.mem_writes.clear();
+            st.current_ip = 0;
         }
 
         // Push the sentinel return address.
@@ -695,6 +792,7 @@ impl EmulationDriver {
             4,
             &mut recovered,
         );
+        self.enrich_writing_ips(&mut recovered);
 
         Ok(RunResult {
             recovered,
@@ -770,6 +868,13 @@ pub struct RecoveredString {
     pub kind: RecoveredKind,
     /// Original encoding observed in emulated memory.
     pub encoding: Encoding,
+    /// Up to a handful of instruction IPs that wrote the bytes of
+    /// this run, collected via the MEM_WRITE hook. The pipeline
+    /// uses these to classify the string as tight when at least
+    /// one writing IP lies inside a discovered loop body. Empty
+    /// when no writes were recorded (e.g. for runs that fell
+    /// through from prefilled bytes).
+    pub writing_ips: Vec<u64>,
 }
 
 /// Result of a single function-emulation run (or aggregated fuzzed run).
@@ -1121,6 +1226,7 @@ fn scan_printable_runs(
                 address: base_address + start as u64,
                 kind,
                 encoding: Encoding::Ascii,
+                writing_ips: Vec::new(),
             });
         }
     }
@@ -1161,6 +1267,7 @@ fn scan_utf16le_runs(
                     address: base_address + start as u64,
                     kind,
                     encoding: Encoding::Utf16Le,
+                    writing_ips: Vec::new(),
                 });
             }
         }

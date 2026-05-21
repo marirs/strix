@@ -237,39 +237,73 @@ fn run_emulated_pipeline<'a>(
     let mut driver_errors: u32 = 0;
     let mut attempts: u32 = 0;
 
-    let push_recovered =
-        |run: crate::driver::RunResult, out: &mut EmulationResults<'a>, driver_errors: &mut u32| {
-            if !run.execution_ok {
-                *driver_errors += 1;
-            }
-            for rec in run.recovered {
-                if rec.value.len() < options.min_length {
-                    continue;
-                }
-                let section_tag = match rec.kind {
-                    RecoveredKind::Decoded => "scratch",
-                    RecoveredKind::Stack => "stack",
-                };
-                let extracted = ExtractedString {
-                    value: Cow::Owned(rec.value),
-                    kind: match rec.kind {
-                        RecoveredKind::Decoded => StringKind::Decoded,
-                        RecoveredKind::Stack => StringKind::Stack,
-                    },
-                    encoding: rec.encoding,
-                    location: Location {
-                        offset: 0,
-                        address: Some(rec.address),
-                        section: Some(section_tag.to_string()),
-                    },
-                };
-                match rec.kind {
-                    RecoveredKind::Decoded if want_decoded => out.decoded.push(extracted),
-                    RecoveredKind::Stack if want_stack => out.stack.push(extracted),
-                    _ => {}
+    // Precompute the loop-body block set for every discovered
+    // function so we can promote emulated stack writes to "tight"
+    // when their writing IP lies inside a loop body.
+    let loop_bodies_by_func: std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>> =
+        funcs
+            .iter()
+            .map(|(va, f)| (*va, stack_strings::detect_loop_bodies_public(f)))
+            .collect();
+
+    // Decide whether `ip` fell inside the loop body of *any*
+    // discovered function. Writes during decoder emulation can
+    // happen in the decoder itself, in callees, or in CRT helpers —
+    // we don't care which function did the write, only whether the
+    // writing instruction lives in a loop body somewhere.
+    let ip_in_loop = |ip: u64| -> bool {
+        for (func_va, func) in &funcs {
+            for (start, block) in &func.blocks {
+                if ip >= *start && ip < block.end {
+                    return loop_bodies_by_func
+                        .get(func_va)
+                        .map(|l| l.contains(start))
+                        .unwrap_or(false);
                 }
             }
-        };
+        }
+        false
+    };
+
+    let push_recovered = |run: crate::driver::RunResult,
+                          _func_va: u64,
+                          out: &mut EmulationResults<'a>,
+                          driver_errors: &mut u32| {
+        if !run.execution_ok {
+            *driver_errors += 1;
+        }
+        for rec in run.recovered {
+            if rec.value.len() < options.min_length {
+                continue;
+            }
+            // Classify a stack-write as tight when at least one
+            // writing IP lies inside a discovered loop body
+            // anywhere in the binary.
+            let is_tight = matches!(rec.kind, RecoveredKind::Stack)
+                && rec.writing_ips.iter().any(|ip| ip_in_loop(*ip));
+            let (final_kind, section_tag) = match rec.kind {
+                RecoveredKind::Decoded => (StringKind::Decoded, "scratch"),
+                RecoveredKind::Stack if is_tight => (StringKind::Tight, "stack-tight"),
+                RecoveredKind::Stack => (StringKind::Stack, "stack"),
+            };
+            let extracted = ExtractedString {
+                value: Cow::Owned(rec.value),
+                kind: final_kind,
+                encoding: rec.encoding,
+                location: Location {
+                    offset: 0,
+                    address: Some(rec.address),
+                    section: Some(section_tag.to_string()),
+                },
+            };
+            match final_kind {
+                StringKind::Decoded if want_decoded => out.decoded.push(extracted),
+                StringKind::Stack if want_stack => out.stack.push(extracted),
+                StringKind::Tight if want_tight => out.tight.push(extracted),
+                _ => {}
+            }
+        }
+    };
 
     let candidate_vas: Vec<u64> = candidates
         .iter()
@@ -280,7 +314,7 @@ fn run_emulated_pipeline<'a>(
     for entry in &candidate_vas {
         attempts += 1;
         match driver.run_function_fuzzed(*entry, options.max_emulation_steps) {
-            Ok(r) => push_recovered(r, out, &mut driver_errors),
+            Ok(r) => push_recovered(r, *entry, out, &mut driver_errors),
             Err(_) => driver_errors += 1,
         }
     }
@@ -312,7 +346,7 @@ fn run_emulated_pipeline<'a>(
         for caller in callers {
             callers_attempted += 1;
             match driver.run_function_fuzzed(caller, caller_step_cap) {
-                Ok(r) => push_recovered(r, out, &mut callers_errors),
+                Ok(r) => push_recovered(r, caller, out, &mut callers_errors),
                 Err(_) => callers_errors += 1,
             }
         }
@@ -419,7 +453,7 @@ fn run_emulated_pipeline<'a>(
                 Ok(r) => {
                     let prev_decoded = out.decoded.len();
                     let prev_stack = out.stack.len();
-                    push_recovered(r, out, &mut driver_errors);
+                    push_recovered(r, *callee, out, &mut driver_errors);
                     if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
                         sites_yielded += 1;
                     }
@@ -467,7 +501,7 @@ fn run_emulated_pipeline<'a>(
                         Ok(r) => {
                             let prev_decoded = out.decoded.len();
                             let prev_stack = out.stack.len();
-                            push_recovered(r, out, &mut driver_errors);
+                            push_recovered(r, *callee, out, &mut driver_errors);
                             if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
                                 sites_yielded += 1;
                             }
