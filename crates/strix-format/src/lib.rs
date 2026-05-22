@@ -109,7 +109,10 @@ impl ParsedInput {
     }
 }
 
-/// Detect and parse the input.
+/// Detect and parse the input, returning the first / only arch.
+///
+/// For fat Mach-O binaries this returns the first slice only —
+/// use [`parse_all`] to get every arch.
 pub fn parse(input: &[u8], hint: Option<FormatHint>) -> Result<ParsedInput> {
     let hint = hint.unwrap_or(FormatHint::Auto);
     match hint {
@@ -119,6 +122,31 @@ pub fn parse(input: &[u8], hint: Option<FormatHint>) -> Result<ParsedInput> {
         FormatHint::MachO => parse_macho(input),
         FormatHint::Sc32 => Ok(parse_shellcode(input, 32)),
         FormatHint::Sc64 => Ok(parse_shellcode(input, 64)),
+    }
+}
+
+/// Detect and parse every arch in the input.
+///
+/// For all formats except fat Mach-O this returns a single-element
+/// Vec. For fat / universal Mach-O it returns one `ParsedInput`
+/// per slice, each with its own `scan_window`, sections,
+/// imports, and symbols. The umbrella `strix::extract` iterates
+/// the Vec so analysts get full output from universal binaries.
+pub fn parse_all(input: &[u8], hint: Option<FormatHint>) -> Result<Vec<ParsedInput>> {
+    let hint = hint.unwrap_or(FormatHint::Auto);
+    match hint {
+        FormatHint::Auto => match Object::parse(input) {
+            Ok(Object::PE(_)) => parse_pe(input).map(|p| vec![p]),
+            Ok(Object::Elf(_)) => parse_elf(input).map(|p| vec![p]),
+            Ok(Object::Mach(_)) => parse_macho_all(input),
+            Ok(_) => Err(Error::UnknownFormat),
+            Err(_) => Err(Error::UnknownFormat),
+        },
+        FormatHint::Pe => parse_pe(input).map(|p| vec![p]),
+        FormatHint::Elf => parse_elf(input).map(|p| vec![p]),
+        FormatHint::MachO => parse_macho_all(input),
+        FormatHint::Sc32 => Ok(vec![parse_shellcode(input, 32)]),
+        FormatHint::Sc64 => Ok(vec![parse_shellcode(input, 64)]),
     }
 }
 
@@ -319,49 +347,71 @@ fn parse_elf(input: &[u8]) -> Result<ParsedInput> {
 }
 
 fn parse_macho(input: &[u8]) -> Result<ParsedInput> {
+    // Back-compat: return only the first arch. Use parse_macho_all
+    // to get every arch in a fat binary.
+    parse_macho_all(input).map(|mut v| v.remove(0))
+}
+
+/// Parse every architecture in a Mach-O binary. For a regular
+/// (non-fat) Mach-O this returns a Vec with a single element; for
+/// a fat / universal binary it returns one ParsedInput per arch,
+/// each with its own slice_offset, sections, imports, and
+/// symbols, ready to be fed through the rest of the extraction
+/// pipeline independently.
+pub fn parse_macho_all(input: &[u8]) -> Result<Vec<ParsedInput>> {
     let mach =
         goblin::mach::Mach::parse(input).map_err(|e| Error::malformed("macho", e.to_string()))?;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut scan_window: Option<(u64, u64)> = None;
-    // Goblin returns *slice-relative* file offsets for fat Mach-O
-    // sections and segments. We need absolute fat-file offsets so
-    // section_at correctly matches scanner offsets. Track the slice's
-    // base offset and add it to every section's file_offset below.
-    let mut slice_offset: u64 = 0;
-    let mo = match mach {
-        goblin::mach::Mach::Binary(b) => b,
+    match mach {
+        goblin::mach::Mach::Binary(b) => Ok(vec![build_macho_parsed(input, 0, b, None)?]),
         goblin::mach::Mach::Fat(f) => {
             let arches: Vec<_> = f.iter_arches().filter_map(|a| a.ok()).collect();
-            if let Some(first) = arches.first() {
-                let off = u64::from(first.offset);
-                let sz = u64::from(first.size);
-                scan_window = Some((off, off.saturating_add(sz)));
-                slice_offset = off;
+            let mut out: Vec<ParsedInput> = Vec::new();
+            for (i, arch_entry) in arches.iter().enumerate() {
+                let off = u64::from(arch_entry.offset);
+                let sz = u64::from(arch_entry.size);
+                let arch_name = cputype_name(arch_entry.cputype());
+                let mo = match f
+                    .get(i)
+                    .map_err(|e| Error::malformed("macho", e.to_string()))?
+                {
+                    goblin::mach::SingleArch::MachO(m) => m,
+                    goblin::mach::SingleArch::Archive(_) => {
+                        // Static archive entries inside a fat
+                        // wrapper aren't analyzable as Mach-O. Skip
+                        // them; analysts care about the executables.
+                        continue;
+                    }
+                };
+                let parsed = build_macho_parsed(input, off, mo, Some((arch_name, sz)))?;
+                out.push(parsed);
             }
-            let arch_names: Vec<&'static str> =
-                arches.iter().map(|a| cputype_name(a.cputype())).collect();
-            if arch_names.len() > 1 {
-                warnings.push(format!(
-                    "fat Mach-O contains {} architectures ({}); only the first was analyzed",
-                    arch_names.len(),
-                    arch_names.join(", ")
+            if out.is_empty() {
+                return Err(Error::malformed(
+                    "macho",
+                    "fat binary had no analyzable Mach-O slices",
                 ));
             }
-            // Take the first sub-archive; ignore static-library entries.
-            match f
-                .get(0)
-                .map_err(|e| Error::malformed("macho", e.to_string()))?
-            {
-                goblin::mach::SingleArch::MachO(m) => m,
-                goblin::mach::SingleArch::Archive(_) => {
-                    return Err(Error::malformed(
-                        "macho",
-                        "fat binary's first arch is a static archive, not a MachO",
-                    ));
-                }
-            }
+            Ok(out)
         }
-    };
+    }
+}
+
+/// Build a `ParsedInput` from a single Mach-O view, honoring the
+/// fat-binary slice offset so all section file_offsets are
+/// absolute into the original input bytes.
+///
+/// `arch_meta` is `Some((arch_name, slice_size))` when called from
+/// the fat-binary path; the scan_window is set to that slice so
+/// scanners don't dredge bytes from neighboring arches.
+fn build_macho_parsed(
+    input: &[u8],
+    slice_offset: u64,
+    mo: goblin::mach::MachO<'_>,
+    arch_meta: Option<(&'static str, u64)>,
+) -> Result<ParsedInput> {
+    let scan_window = arch_meta.map(|(_, sz)| (slice_offset, slice_offset.saturating_add(sz)));
+    let _ = arch_meta; // arch_name is only used for the warning in callers
+    let warnings: Vec<String> = Vec::new();
     let bits: u8 = if mo.is_64 { 64 } else { 32 };
     let arch = match mo.header.cputype {
         goblin::mach::cputype::CPU_TYPE_X86 => "x86",

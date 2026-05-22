@@ -94,6 +94,27 @@ pub fn extract_emulated<'a>(
         return Ok(EmulationResults::default());
     }
 
+    // The analyzer and emulator are x86-only. If the binary is a
+    // different architecture, the iced-x86 decoder would interpret
+    // its bytes as garbage instructions, producing no useful
+    // function discovery. Detect this case up front and emit an
+    // explicit warning so analysts know why decoded / stack /
+    // tight are empty by design — instead of silently producing
+    // nothing.
+    let is_x86_family = matches!(
+        parsed.metadata.arch.as_deref(),
+        Some("x86") | Some("x86_64") | None
+    );
+    if !is_x86_family {
+        let mut out = EmulationResults::default();
+        out.warnings.push(format!(
+            "emulator pipeline supports x86 / x86_64 only; \
+             skipping for arch={}",
+            parsed.metadata.arch.as_deref().unwrap_or("unknown")
+        ));
+        return Ok(out);
+    }
+
     let mut out = EmulationResults::default();
 
     // Pattern-based stack-string recovery: pure disassembly, no
