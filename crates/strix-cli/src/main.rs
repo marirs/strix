@@ -153,6 +153,31 @@ struct Cli {
     /// decoded payload.
     #[arg(long)]
     brief: bool,
+
+    /// Drop emulation-recovered strings whose source function isn't
+    /// in the decoder-candidate list. Static and language strings
+    /// are still emitted normally. Useful for very large binaries
+    /// where the candidate list is short but the recovery picked up
+    /// stray strings from CRT helpers.
+    #[arg(long)]
+    candidates_only: bool,
+
+    /// Dump-decoder mode: run only the single function at this
+    /// virtual address through the emulator, then print every
+    /// recovered byte alongside the writing instruction's
+    /// disassembly. Accepts hex (0x140001000) or decimal. Bypasses
+    /// the normal extraction pipeline.
+    #[arg(long, value_parser = parse_va)]
+    dump_decoder: Option<u64>,
+}
+
+fn parse_va(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
+    match stripped {
+        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| e.to_string()),
+        None => s.parse::<u64>().map_err(|e| e.to_string()),
+    }
 }
 
 fn main() -> Result<()> {
@@ -205,7 +230,66 @@ fn main() -> Result<()> {
         min_quality: cli.min_quality,
     };
 
-    let result = strix::extract(bytes, &options)?;
+    // --dump-decoder short-circuits the normal extraction.
+    #[cfg(feature = "unicorn")]
+    if let Some(va) = cli.dump_decoder {
+        let stdout = io::stdout();
+        let sink: Box<dyn Write> = match &cli.output {
+            Some(path) => {
+                let f =
+                    File::create(path).with_context(|| format!("creating {}", path.display()))?;
+                Box::new(BufWriter::new(f))
+            }
+            None => Box::new(stdout.lock()),
+        };
+        let mut out = sink;
+        let dumps = strix::dump_decoder(bytes, &options, va)?;
+        if dumps.is_empty() {
+            writeln!(out, "no strings recovered from function {va:#018x}")?;
+        } else {
+            writeln!(
+                out,
+                "=== dump of function {va:#018x} ({} strings) ===",
+                dumps.len()
+            )?;
+            for d in dumps {
+                let ip = d
+                    .writing_ip
+                    .map(|v| format!("{:#018x}", v))
+                    .unwrap_or_else(|| "                  ".to_string());
+                let disasm = d.writing_disasm.as_deref().unwrap_or("");
+                writeln!(out, "{ip}  {disasm:<40}  -> {}", d.value)?;
+            }
+        }
+        out.flush()?;
+        return Ok(());
+    }
+    #[cfg(not(feature = "unicorn"))]
+    if cli.dump_decoder.is_some() {
+        anyhow::bail!("--dump-decoder requires building with --features unicorn");
+    }
+
+    let mut result = strix::extract(bytes, &options)?;
+
+    // --candidates-only: drop every decoded/stack/tight string
+    // whose producing function isn't on the candidate list.
+    if cli.candidates_only {
+        use std::collections::BTreeSet;
+        let candidate_vas: BTreeSet<u64> = result.candidates.iter().map(|c| c.va).collect();
+        result.strings.retain(|s| {
+            let is_emul = matches!(
+                s.kind,
+                StringKind::Decoded | StringKind::Stack | StringKind::Tight
+            );
+            if !is_emul {
+                return true;
+            }
+            match s.location.function_va {
+                Some(va) => candidate_vas.contains(&va),
+                None => false,
+            }
+        });
+    }
 
     // Open the chosen sink.
     let stdout = io::stdout();

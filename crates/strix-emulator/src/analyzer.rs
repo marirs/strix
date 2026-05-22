@@ -137,6 +137,50 @@ impl<'a> CodeAnalyzer<'a> {
         Some(&self.bytes[start..end])
     }
 
+    /// Count `lea reg, [rip+disp]` references whose effective
+    /// target VA appears in `targets`. Walks every discovered
+    /// function's basic blocks. Used by the umbrella crate to
+    /// decorate static strings with how often code references
+    /// them.
+    pub fn count_rip_xrefs(
+        &self,
+        targets: &std::collections::HashSet<u64>,
+    ) -> std::collections::HashMap<u64, u32> {
+        let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        if targets.is_empty() {
+            return counts;
+        }
+        let funcs = self.discover_all();
+        for func in funcs.values() {
+            for block in func.blocks.values() {
+                let Some(bytes) = self.bytes_at_va(block.start) else {
+                    continue;
+                };
+                let len = (block.end.saturating_sub(block.start)) as usize;
+                let len = len.min(bytes.len());
+                let decoder = Decoder::with_ip(
+                    self.bitness,
+                    &bytes[..len],
+                    block.start,
+                    DecoderOptions::NONE,
+                );
+                for insn in decoder {
+                    if insn.mnemonic() != iced_x86::Mnemonic::Lea {
+                        continue;
+                    }
+                    if !insn.is_ip_rel_memory_operand() {
+                        continue;
+                    }
+                    let target = insn.ip_rel_memory_address();
+                    if targets.contains(&target) {
+                        *counts.entry(target).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        counts
+    }
+
     /// Read up to `len` bytes from the binary at virtual address
     /// `va`, regardless of section permissions. Returns `None` when
     /// `va` isn't in any mapped section.

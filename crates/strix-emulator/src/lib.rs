@@ -133,6 +133,7 @@ pub fn extract_emulated<'a>(
                     section: Some(section_tag.to_string()),
                     function_va: Some(rec.function_va),
                     source_va: None,
+                    xrefs: 0,
                 },
             });
         }
@@ -157,6 +158,84 @@ pub fn extract_emulated<'a>(
         run_emulated_pipeline(input, parsed, options, want, &mut out)?;
         Ok(out)
     }
+}
+
+/// One recovered string from a `dump_decoder` run, enriched with
+/// the disassembly of the instruction that wrote its first byte.
+#[derive(Debug, Clone)]
+pub struct DumpedString {
+    /// UTF-8 form of the recovered bytes.
+    pub value: String,
+    /// Memory address in the emulator the bytes were read from
+    /// (typically in scratch / stack / heap).
+    pub address: u64,
+    /// Instruction VA in the analyzed binary that wrote the first
+    /// byte of this run, if the MEM_WRITE hook captured it.
+    pub writing_ip: Option<u64>,
+    /// Intel-syntax disassembly of the instruction at `writing_ip`,
+    /// when we could decode it.
+    pub writing_disasm: Option<String>,
+}
+
+/// Run only the single function at `va` through the emulation
+/// driver and return each recovered string annotated with the
+/// disassembly of the writing instruction. Useful for hand-
+/// verifying a specific decoder candidate.
+#[cfg(feature = "unicorn")]
+pub fn dump_decoder_at(
+    input: &[u8],
+    parsed: &ParsedInput,
+    options: &ExtractOptions,
+    va: u64,
+) -> Result<Vec<DumpedString>> {
+    use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
+
+    use crate::analyzer::CodeAnalyzer;
+    use crate::driver::EmulationDriver;
+
+    let analyzer = CodeAnalyzer::new(input, parsed);
+    let bitness = analyzer.bitness();
+
+    let mut driver = EmulationDriver::new(input, parsed)?;
+    // Cap a single dump-run more generously than the default
+    // candidate budget — the analyst is targeting one function and
+    // wants to see what it produces.
+    let cap = options.max_emulation_steps.saturating_mul(4).max(40_000);
+    let run = driver.run_function_fuzzed(va, cap)?;
+
+    // Build a small disassembly cache so we don't redecode the
+    // same writing IP repeatedly.
+    let mut disasm_cache: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut fmt = IntelFormatter::new();
+
+    let mut out = Vec::with_capacity(run.recovered.len());
+    for rec in &run.recovered {
+        let writing_ip = rec.writing_ips.first().copied();
+        let writing_disasm = if let Some(ip) = writing_ip {
+            if let Some(text) = disasm_cache.get(&ip) {
+                Some(text.clone())
+            } else if let Some(bytes) = analyzer.bytes_at_va(ip) {
+                let look = &bytes[..bytes.len().min(16)];
+                let mut dec = Decoder::with_ip(bitness, look, ip, DecoderOptions::NONE);
+                let insn = dec.decode();
+                let mut s = String::new();
+                fmt.format(&insn, &mut s);
+                disasm_cache.insert(ip, s.clone());
+                Some(s)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        out.push(DumpedString {
+            value: rec.value.clone(),
+            address: rec.address,
+            writing_ip,
+            writing_disasm,
+        });
+    }
+    Ok(out)
 }
 
 /// Convert a `ResolvedRegs` from the callsite-dataflow pass into a
@@ -321,6 +400,7 @@ fn run_emulated_pipeline<'a>(
                     section: Some(section_tag.to_string()),
                     function_va,
                     source_va,
+                    xrefs: 0,
                 },
             };
             match final_kind {

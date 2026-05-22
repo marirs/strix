@@ -105,6 +105,18 @@ pub struct Location {
     /// `.rdata` blob it came from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_va: Option<u64>,
+    /// How many `lea reg, [rip+disp]` instructions across all
+    /// discovered functions point at this string's VA. Useful for
+    /// ranking: strings referenced from many sites are more
+    /// likely to be meaningful than one-off literals. Set only
+    /// for static strings (which have a fixed VA); zero / omitted
+    /// for emulation-recovered strings.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub xrefs: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Location {
@@ -116,6 +128,7 @@ impl Location {
             section: None,
             function_va: None,
             source_va: None,
+            xrefs: 0,
         }
     }
 }

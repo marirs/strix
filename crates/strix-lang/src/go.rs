@@ -167,6 +167,7 @@ fn extract_pclntab_names<'a>(
                         section: Some(section.name.clone()),
                         function_va: None,
                         source_va: None,
+                        xrefs: 0,
                     },
                 });
                 emitted += 1;

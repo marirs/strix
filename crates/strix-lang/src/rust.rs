@@ -61,6 +61,7 @@ pub(crate) fn extract<'a>(
             .any(|s| section.name.contains(s))
         {
             extract_rustc_metadata(input, section, options, out);
+            extract_rustc_crate_names(input, section, options, out);
         }
     }
 
@@ -78,6 +79,7 @@ pub(crate) fn extract<'a>(
                     section: None,
                     function_va: Some(va),
                     source_va: None,
+                    xrefs: 0,
                 },
             });
         }
@@ -129,6 +131,7 @@ fn extract_rustc_metadata<'a>(
                     section: Some(section.name.clone()),
                     function_va: None,
                     source_va: None,
+                    xrefs: 0,
                 },
             });
         }
@@ -170,4 +173,70 @@ fn is_rust_mangled(name: &str) -> bool {
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Heuristic extraction of plaintext crate identifiers from the
+/// `.rustc` section. Rust's metadata blob is compressed, but
+/// crate-name strings often appear in a plaintext header / index
+/// region near the start. Scan the first 8 KB for runs that match
+/// the Rust crate-identifier shape: `[a-z_][a-z0-9_]*` of length
+/// 4..=32. Emit each unique match as a Rust-kind string.
+fn extract_rustc_crate_names<'a>(
+    input: &'a [u8],
+    section: &strix_format::Section,
+    options: &ExtractOptions,
+    out: &mut Vec<ExtractedString<'a>>,
+) {
+    let start = section.file_offset as usize;
+    let end = (section.file_offset + section.file_size) as usize;
+    if start >= input.len() || end > input.len() {
+        return;
+    }
+    let scan_end = end.min(start + 8192);
+    let bytes = &input[start..scan_end];
+
+    let mut emitted: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Crate names start with [a-z_].
+        if !(b.is_ascii_lowercase() || b == b'_') {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut run_end = i;
+        while run_end < bytes.len() {
+            let c = bytes[run_end];
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' {
+                run_end += 1;
+            } else {
+                break;
+            }
+        }
+        let len = run_end - run_start;
+        if (4..=32).contains(&len) && len >= options.min_length {
+            // SAFETY: every byte was ASCII alnum/underscore.
+            let s: &'a str = unsafe {
+                std::str::from_utf8_unchecked(&input[start + run_start..start + run_end])
+            };
+            if emitted.insert(s) {
+                let abs_offset = start + run_start;
+                out.push(ExtractedString {
+                    value: Cow::Borrowed(s),
+                    kind: StringKind::Rust,
+                    encoding: Encoding::Utf8,
+                    location: Location {
+                        offset: abs_offset as u64,
+                        address: section.offset_to_va(abs_offset as u64),
+                        section: Some(section.name.clone()),
+                        function_va: None,
+                        source_va: None,
+                        xrefs: 0,
+                    },
+                });
+            }
+        }
+        i = run_end.max(i + 1);
+    }
 }

@@ -41,6 +41,20 @@ pub use strix_core::{
 };
 pub use strix_format::{ParsedInput, Section};
 
+#[cfg(feature = "unicorn")]
+pub use strix_emulator::{DumpedString, dump_decoder_at};
+
+/// Dump-decoder convenience wrapper: parses `input`, then runs
+/// the emulation driver against the function at `va` and returns
+/// each recovered string annotated with the writing instruction's
+/// disassembly. Only available when built with the `unicorn`
+/// feature.
+#[cfg(feature = "unicorn")]
+pub fn dump_decoder(input: &[u8], options: &ExtractOptions, va: u64) -> Result<Vec<DumpedString>> {
+    let parsed = strix_format::parse(input, options.format_override)?;
+    dump_decoder_at(input, &parsed, options, va)
+}
+
 /// Run all enabled extractors over `input` and return a combined result.
 ///
 /// This is the main library entry point. The returned
@@ -166,6 +180,37 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
     result.candidates = emul.candidates;
     for w in emul.warnings {
         result.warnings.push(w);
+    }
+
+    // Xref counts: for every static string with a known VA, count
+    // how many `lea reg, [rip+disp]` instructions across the
+    // discovered code reference it. The CodeAnalyzer pass is
+    // always available (it doesn't require unicorn) so this works
+    // regardless of feature gating.
+    {
+        use std::collections::HashSet;
+        let mut targets: HashSet<u64> = HashSet::new();
+        for s in &result.strings {
+            if matches!(s.kind, StringKind::StaticAscii | StringKind::StaticUtf16Le)
+                && let Some(va) = s.location.address
+            {
+                targets.insert(va);
+            }
+        }
+        if !targets.is_empty() {
+            let analyzer = strix_emulator::analyzer::CodeAnalyzer::new(input, &parsed);
+            let counts = analyzer.count_rip_xrefs(&targets);
+            for s in &mut result.strings {
+                if !matches!(s.kind, StringKind::StaticAscii | StringKind::StaticUtf16Le) {
+                    continue;
+                }
+                if let Some(va) = s.location.address
+                    && let Some(count) = counts.get(&va)
+                {
+                    s.location.xrefs = *count;
+                }
+            }
+        }
     }
 
     // Optional quality filter: drop strings whose content-based
