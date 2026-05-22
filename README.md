@@ -49,6 +49,16 @@ stack-string extraction. The `unicorn` feature adds the brute-force
 emulation pipeline for decoded strings; it pulls in the `unicorn-engine`
 C library and requires `cmake` + a C toolchain at build time.
 
+The optional `aarch64` feature enables AArch64 function discovery and
+stack-string pattern matching for ARM64 binaries (via the pure-Rust
+`bad64` disassembler — no extra system deps):
+
+```sh
+cargo build --release --features unicorn,aarch64 -p strix-cli
+```
+
+Default builds (x86 / x86_64 only) are unaffected.
+
 ## CLI usage
 
 ```sh
