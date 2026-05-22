@@ -27,6 +27,10 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "aarch64")]
+pub mod aarch64;
+#[cfg(feature = "aarch64")]
+pub mod aarch64_stack_strings;
 pub mod analyzer;
 pub mod callsite;
 #[cfg(feature = "unicorn")]
@@ -94,23 +98,77 @@ pub fn extract_emulated<'a>(
         return Ok(EmulationResults::default());
     }
 
-    // The analyzer and emulator are x86-only. If the binary is a
-    // different architecture, the iced-x86 decoder would interpret
-    // its bytes as garbage instructions, producing no useful
-    // function discovery. Detect this case up front and emit an
-    // explicit warning so analysts know why decoded / stack /
-    // tight are empty by design — instead of silently producing
-    // nothing.
-    let is_x86_family = matches!(
-        parsed.metadata.arch.as_deref(),
-        Some("x86") | Some("x86_64") | None
-    );
+    // Arch dispatch.
+    //
+    //  - x86 / x86_64 (or None for shellcode) → existing iced-x86
+    //    pipeline.
+    //  - aarch64 with the `aarch64` feature → bad64-backed
+    //    function discovery + stack-string pattern matcher (no
+    //    decoded extraction yet; that needs the AArch64 emulator
+    //    backend).
+    //  - anything else → return empty with a warning naming the
+    //    unsupported arch so analysts know decoded / stack /
+    //    tight are empty by design.
+    let arch = parsed.metadata.arch.as_deref();
+    let is_x86_family = matches!(arch, Some("x86") | Some("x86_64") | None);
     if !is_x86_family {
+        #[cfg(feature = "aarch64")]
+        if matches!(arch, Some("aarch64")) {
+            let mut out = EmulationResults::default();
+            if want.1 || want.2 {
+                for rec in aarch64_stack_strings::extract(input, parsed, options.min_length) {
+                    let (kind, section_tag) = if rec.is_tight {
+                        (StringKind::Tight, "stack-tight")
+                    } else {
+                        (StringKind::Stack, "stack")
+                    };
+                    let keep = match kind {
+                        StringKind::Tight => want.2,
+                        StringKind::Stack => want.1,
+                        _ => false,
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    let bucket = if kind == StringKind::Tight {
+                        &mut out.tight
+                    } else {
+                        &mut out.stack
+                    };
+                    bucket.push(ExtractedString {
+                        value: Cow::Owned(rec.value),
+                        kind,
+                        encoding: Encoding::Ascii,
+                        location: Location {
+                            offset: 0,
+                            address: Some(rec.function_va),
+                            section: Some(section_tag.to_string()),
+                            function_va: Some(rec.function_va),
+                            source_va: None,
+                            xrefs: 0,
+                        },
+                    });
+                }
+            }
+            if want.0 {
+                out.warnings.push(
+                    "aarch64 decoded-string extraction is not implemented yet; \
+                     stack / tight strings only"
+                        .to_string(),
+                );
+            }
+            return Ok(out);
+        }
         let mut out = EmulationResults::default();
         out.warnings.push(format!(
-            "emulator pipeline supports x86 / x86_64 only; \
+            "emulator pipeline supports x86 / x86_64 only{}; \
              skipping for arch={}",
-            parsed.metadata.arch.as_deref().unwrap_or("unknown")
+            if cfg!(feature = "aarch64") {
+                " plus aarch64 (pattern-based)"
+            } else {
+                ""
+            },
+            arch.unwrap_or("unknown")
         ));
         return Ok(out);
     }

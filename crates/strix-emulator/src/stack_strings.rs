@@ -84,10 +84,9 @@ pub fn extract(input: &[u8], parsed: &ParsedInput, min_len: usize) -> Vec<Recove
     out
 }
 
-/// Public re-export of [`detect_loop_bodies`] for callers outside
-/// this module (the emulation pipeline uses it to classify
-/// emulated stack writes as tight when their writing IP lies in a
-/// loop-body block).
+/// Public wrapper around the private `detect_loop_bodies` helper
+/// so the emulation pipeline can classify emulated stack writes
+/// as tight when their writing IP lies in a loop-body block.
 pub fn detect_loop_bodies_public(func: &Function) -> BTreeSet<u64> {
     detect_loop_bodies(func)
 }

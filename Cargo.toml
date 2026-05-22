@@ -42,6 +42,10 @@ clap        = { version = "4", features = ["derive"] }
 anyhow      = "1"
 memmap2     = "0.9"
 iced-x86    = "1"
+# Pure-Rust AArch64 disassembler. Optional, gated behind the
+# `aarch64` feature in strix-emulator so x86-only builds don't
+# pull it in.
+bad64       = "0.12"
 
 [profile.release]
 opt-level = 3
