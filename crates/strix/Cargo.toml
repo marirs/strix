@@ -24,7 +24,3 @@ default = []
 # Forward the emulator's `unicorn` feature so users who want the
 # decoded/stack/tight extractors can opt in.
 unicorn = ["strix-emulator/unicorn"]
-# Forward the emulator's `aarch64` feature so users who want
-# AArch64 function discovery + stack-string pattern matching can
-# opt in (pulls in bad64).
-aarch64 = ["strix-emulator/aarch64"]

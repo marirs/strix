@@ -27,9 +27,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
-#[cfg(feature = "aarch64")]
 pub mod aarch64;
-#[cfg(feature = "aarch64")]
 pub mod aarch64_stack_strings;
 pub mod analyzer;
 pub mod callsite;
@@ -102,17 +100,15 @@ pub fn extract_emulated<'a>(
     //
     //  - x86 / x86_64 (or None for shellcode) → existing iced-x86
     //    pipeline.
-    //  - aarch64 with the `aarch64` feature → bad64-backed
-    //    function discovery + stack-string pattern matcher (no
-    //    decoded extraction yet; that needs the AArch64 emulator
-    //    backend).
+    //  - aarch64 → bad64-backed function discovery + stack-string
+    //    pattern matcher (no decoded extraction yet; that needs the
+    //    AArch64 emulator backend).
     //  - anything else → return empty with a warning naming the
     //    unsupported arch so analysts know decoded / stack /
     //    tight are empty by design.
     let arch = parsed.metadata.arch.as_deref();
     let is_x86_family = matches!(arch, Some("x86") | Some("x86_64") | None);
     if !is_x86_family {
-        #[cfg(feature = "aarch64")]
         if matches!(arch, Some("aarch64")) {
             let mut out = EmulationResults::default();
             if want.1 || want.2 {
@@ -161,13 +157,8 @@ pub fn extract_emulated<'a>(
         }
         let mut out = EmulationResults::default();
         out.warnings.push(format!(
-            "emulator pipeline supports x86 / x86_64 only{}; \
+            "emulator pipeline supports x86 / x86_64 plus aarch64 (pattern-based); \
              skipping for arch={}",
-            if cfg!(feature = "aarch64") {
-                " plus aarch64 (pattern-based)"
-            } else {
-                ""
-            },
             arch.unwrap_or("unknown")
         ));
         return Ok(out);

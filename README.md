@@ -45,19 +45,15 @@ cargo build --release --features unicorn -p strix-cli
 ```
 
 Without `--features unicorn` you still get static, language, and
-stack-string extraction. The `unicorn` feature adds the brute-force
-emulation pipeline for decoded strings; it pulls in the `unicorn-engine`
-C library and requires `cmake` + a C toolchain at build time.
+stack-string extraction (x86, x86_64, and AArch64). The `unicorn`
+feature adds the brute-force emulation pipeline for decoded strings;
+it pulls in the `unicorn-engine` C library and requires `cmake` + a
+C toolchain at build time.
 
-The optional `aarch64` feature enables AArch64 function discovery and
-stack-string pattern matching for ARM64 binaries (via the pure-Rust
-`bad64` disassembler — no extra system deps):
-
-```sh
-cargo build --release --features unicorn,aarch64 -p strix-cli
-```
-
-Default builds (x86 / x86_64 only) are unaffected.
+AArch64 (ARM64) function discovery and stack-string pattern matching
+are always on — bad64 is a pure-Rust disassembler so it adds no
+system dependencies. Decoded-string extraction on AArch64 binaries
+still requires the AArch64 emulator backend (planned).
 
 ## CLI usage
 

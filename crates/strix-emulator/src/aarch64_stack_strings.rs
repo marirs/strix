@@ -19,8 +19,6 @@
 //! As with the x86 matcher we accumulate bytes per stack offset
 //! per basic block, then flush printable runs.
 
-#![cfg(feature = "aarch64")]
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bad64::{Imm, Op, Operand, Reg, Shift, decode};

@@ -11,6 +11,7 @@ rust-version.workspace = true
 strix-core = { workspace = true }
 strix-format = { workspace = true }
 iced-x86 = { workspace = true }
+bad64 = { workspace = true }
 log = { workspace = true }
 
 [features]
@@ -18,16 +19,7 @@ default = []
 # Gate Unicorn behind a feature so users who only need static + lang
 # strings don't have to link the C library.
 unicorn = ["dep:unicorn-engine"]
-# Opt-in AArch64 support. Pulls in `bad64` for AArch64 disassembly
-# and turns on the aarch64-specific function discovery + stack-
-# string pattern matcher. Off by default so x86-only users don't
-# pay for it.
-aarch64 = ["dep:bad64"]
 
 [dependencies.unicorn-engine]
 version = "2"
-optional = true
-
-[dependencies.bad64]
-workspace = true
 optional = true

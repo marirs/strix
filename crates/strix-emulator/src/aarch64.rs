@@ -25,8 +25,6 @@
 //! * Switch-table reconstruction.
 //! * Tail-call detection.
 
-#![cfg(feature = "aarch64")]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bad64::{Imm, Op, Operand, Reg, decode};
