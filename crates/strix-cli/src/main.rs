@@ -30,6 +30,8 @@ enum FormatArg {
     macho,
     sc32,
     sc64,
+    sc32_arm,
+    sc64_arm64,
 }
 
 impl From<FormatArg> for FormatHint {
@@ -41,6 +43,8 @@ impl From<FormatArg> for FormatHint {
             FormatArg::macho => FormatHint::MachO,
             FormatArg::sc32 => FormatHint::Sc32,
             FormatArg::sc64 => FormatHint::Sc64,
+            FormatArg::sc32_arm => FormatHint::Sc32Arm,
+            FormatArg::sc64_arm64 => FormatHint::Sc64Arm64,
         }
     }
 }

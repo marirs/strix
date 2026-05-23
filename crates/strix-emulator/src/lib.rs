@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 
 pub mod aarch64;
+pub mod aarch64_callsite;
 pub mod aarch64_stack_strings;
 pub mod analyzer;
 pub mod callsite;
@@ -99,10 +100,11 @@ pub fn extract_emulated<'a>(
     // Arch dispatch.
     //
     //  - x86 / x86_64 (or None for shellcode) → existing iced-x86
-    //    pipeline.
-    //  - aarch64 → bad64-backed function discovery + stack-string
-    //    pattern matcher (no decoded extraction yet; that needs the
-    //    AArch64 emulator backend).
+    //    pipeline below.
+    //  - aarch64 → dedicated AArch64 pipeline: bad64-backed function
+    //    discovery + stack-string pattern matcher, plus (with the
+    //    `unicorn` feature) brute-force emulation of every discovered
+    //    function for decoded strings.
     //  - anything else → return empty with a warning naming the
     //    unsupported arch so analysts know decoded / stack /
     //    tight are empty by design.
@@ -111,53 +113,12 @@ pub fn extract_emulated<'a>(
     if !is_x86_family {
         if matches!(arch, Some("aarch64")) {
             let mut out = EmulationResults::default();
-            if want.1 || want.2 {
-                for rec in aarch64_stack_strings::extract(input, parsed, options.min_length) {
-                    let (kind, section_tag) = if rec.is_tight {
-                        (StringKind::Tight, "stack-tight")
-                    } else {
-                        (StringKind::Stack, "stack")
-                    };
-                    let keep = match kind {
-                        StringKind::Tight => want.2,
-                        StringKind::Stack => want.1,
-                        _ => false,
-                    };
-                    if !keep {
-                        continue;
-                    }
-                    let bucket = if kind == StringKind::Tight {
-                        &mut out.tight
-                    } else {
-                        &mut out.stack
-                    };
-                    bucket.push(ExtractedString {
-                        value: Cow::Owned(rec.value),
-                        kind,
-                        encoding: Encoding::Ascii,
-                        location: Location {
-                            offset: 0,
-                            address: Some(rec.function_va),
-                            section: Some(section_tag.to_string()),
-                            function_va: Some(rec.function_va),
-                            source_va: None,
-                            xrefs: 0,
-                        },
-                    });
-                }
-            }
-            if want.0 {
-                out.warnings.push(
-                    "aarch64 decoded-string extraction is not implemented yet; \
-                     stack / tight strings only"
-                        .to_string(),
-                );
-            }
+            run_aarch64_pipeline(input, parsed, options, want, &mut out)?;
             return Ok(out);
         }
         let mut out = EmulationResults::default();
         out.warnings.push(format!(
-            "emulator pipeline supports x86 / x86_64 plus aarch64 (pattern-based); \
+            "emulator pipeline supports x86 / x86_64 plus aarch64; \
              skipping for arch={}",
             arch.unwrap_or("unknown")
         ));
@@ -762,4 +723,265 @@ fn run_emulated_pipeline<'a>(
         .collect();
 
     Ok(())
+}
+
+/// AArch64 emulation pipeline.
+///
+/// Runs first the bad64-backed stack-string pattern matcher (which
+/// doesn't require Unicorn), then — when the `unicorn` feature is
+/// enabled — the brute-force emulation driver on each discovered
+/// AArch64 function up to a cap, harvesting decoded strings from
+/// scratch / heap / stack.
+///
+/// Function scoring isn't ported to AArch64 yet, so this pass
+/// emulates every discovered function (up to `MAX_CANDIDATES`)
+/// rather than only score-ranked ones. The cost is some extra
+/// wall-clock; the upside is no decoder is missed because the
+/// x86-flavored heuristics didn't recognize its shape.
+fn run_aarch64_pipeline<'a>(
+    input: &'a [u8],
+    parsed: &ParsedInput,
+    options: &ExtractOptions,
+    want: (bool, bool, bool),
+    out: &mut EmulationResults<'a>,
+) -> Result<()> {
+    use std::borrow::Cow;
+    use strix_core::{Encoding, Location};
+
+    let (want_decoded, want_stack, want_tight) = want;
+
+    // 1. Stack-string pattern matcher (pure disassembly, always on).
+    if want_stack || want_tight {
+        for rec in aarch64_stack_strings::extract(input, parsed, options.min_length) {
+            let (kind, section_tag) = if rec.is_tight {
+                (StringKind::Tight, "stack-tight")
+            } else {
+                (StringKind::Stack, "stack")
+            };
+            let keep = match kind {
+                StringKind::Tight => want_tight,
+                StringKind::Stack => want_stack,
+                _ => false,
+            };
+            if !keep {
+                continue;
+            }
+            let bucket = if kind == StringKind::Tight {
+                &mut out.tight
+            } else {
+                &mut out.stack
+            };
+            bucket.push(ExtractedString {
+                value: Cow::Owned(rec.value),
+                kind,
+                encoding: Encoding::Ascii,
+                location: Location {
+                    offset: 0,
+                    address: Some(rec.function_va),
+                    section: Some(section_tag.to_string()),
+                    function_va: Some(rec.function_va),
+                    source_va: None,
+                    xrefs: 0,
+                },
+            });
+        }
+    }
+
+    // 2. Brute-force emulation (decoded strings). Only with `unicorn`.
+    #[cfg(feature = "unicorn")]
+    {
+        if want_decoded || want_stack || want_tight {
+            run_aarch64_emulation(input, parsed, options, want, out)?;
+        }
+    }
+    #[cfg(not(feature = "unicorn"))]
+    {
+        if want_decoded {
+            out.warnings.push(
+                "decoded-string extraction needs the `unicorn` feature; \
+                 aarch64 stack / tight strings only"
+                    .to_string(),
+            );
+        }
+        let _ = (input, parsed, options);
+    }
+
+    Ok(())
+}
+
+/// Brute-force emulation pass for AArch64. Discovers every function
+/// via [`aarch64::AArch64Analyzer`], emulates each one with the
+/// fuzzed argument schedule, and pushes recovered printable runs
+/// into `out`.
+#[cfg(feature = "unicorn")]
+fn run_aarch64_emulation<'a>(
+    input: &'a [u8],
+    parsed: &ParsedInput,
+    options: &ExtractOptions,
+    want: (bool, bool, bool),
+    out: &mut EmulationResults<'a>,
+) -> Result<()> {
+    use std::borrow::Cow;
+    use strix_core::Location;
+
+    use crate::aarch64::AArch64Analyzer;
+    use crate::aarch64_callsite::{
+        find_call_sites_aarch64, resolve_call_site_regs_aarch64,
+        resolve_call_site_regs_aarch64_cross_block,
+    };
+    use crate::driver::{EmulationDriver, RecoveredKind};
+
+    let (want_decoded, want_stack, want_tight) = want;
+
+    // 1. Discover all AArch64 functions.
+    let analyzer = AArch64Analyzer::new(input, parsed);
+    let funcs = analyzer.discover_all();
+    if funcs.is_empty() {
+        out.warnings
+            .push("no aarch64 functions discovered; nothing to emulate".to_string());
+        return Ok(());
+    }
+
+    // 2. Build the driver (maps scratch / heap / stack / stub regions,
+    //    patches import IAT to stub addresses, installs hooks).
+    let mut driver = match EmulationDriver::new(input, parsed) {
+        Ok(d) => d,
+        Err(e) => {
+            out.warnings
+                .push(format!("aarch64 driver construction failed: {e}"));
+            return Ok(());
+        }
+    };
+
+    let candidate_vas: Vec<u64> = funcs.keys().copied().take(MAX_CANDIDATES).collect();
+    let mut errors: u32 = 0;
+    let mut attempts: u32 = 0;
+
+    let push_recovered = |run: crate::driver::RunResult,
+                          fallback_func_va: u64,
+                          out: &mut EmulationResults<'a>,
+                          driver_errors: &mut u32| {
+        if !run.execution_ok {
+            *driver_errors += 1;
+        }
+        for rec in run.recovered {
+            if rec.value.len() < options.min_length {
+                continue;
+            }
+            let (final_kind, section_tag) = match rec.kind {
+                RecoveredKind::Decoded => (StringKind::Decoded, "scratch"),
+                RecoveredKind::Stack => (StringKind::Stack, "stack"),
+            };
+            let extracted = ExtractedString {
+                value: Cow::Owned(rec.value),
+                kind: final_kind,
+                encoding: rec.encoding,
+                location: Location {
+                    offset: 0,
+                    address: Some(rec.address),
+                    section: Some(section_tag.to_string()),
+                    function_va: Some(fallback_func_va),
+                    source_va: None,
+                    xrefs: 0,
+                },
+            };
+            match final_kind {
+                StringKind::Decoded if want_decoded => out.decoded.push(extracted),
+                StringKind::Stack if want_stack => out.stack.push(extracted),
+                _ => {}
+            }
+        }
+    };
+
+    // 3. Brute-force fuzz every candidate.
+    for entry in &candidate_vas {
+        attempts += 1;
+        match driver.run_function_fuzzed(*entry, options.max_emulation_steps) {
+            Ok(r) => push_recovered(r, *entry, out, &mut errors),
+            Err(_) => errors += 1,
+        }
+    }
+
+    // 4. Call-site dataflow: for each candidate, find BL sites,
+    //    resolve X0..X7 via forward sweep, build a concrete ArgSet,
+    //    and emulate the decoder again with those args. This is what
+    //    recovers decoders whose source pointer is materialized by
+    //    the caller via `adrp + add` pointing at .rodata.
+    const MAX_SITES_PER_CANDIDATE: usize = 6;
+    let callsite_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
+    let mut sites_run: u32 = 0;
+    let mut sites_errors: u32 = 0;
+    for callee in &candidate_vas {
+        let sites = find_call_sites_aarch64(&analyzer, &funcs, *callee, MAX_SITES_PER_CANDIDATE);
+        for site in sites {
+            let regs = match funcs.get(&site.caller_va) {
+                Some(caller_func) => {
+                    resolve_call_site_regs_aarch64_cross_block(&analyzer, caller_func, site)
+                }
+                None => resolve_call_site_regs_aarch64(&analyzer, site),
+            };
+            if !any_resolved(&regs) {
+                continue;
+            }
+            let args = aarch64_resolved_to_argset(&driver.layout, regs);
+            sites_run += 1;
+            match driver.run_function(*callee, callsite_step_cap, &args) {
+                Ok(r) => push_recovered(r, *callee, out, &mut sites_errors),
+                Err(_) => sites_errors += 1,
+            }
+        }
+    }
+    if sites_run > 0 && sites_errors == sites_run {
+        out.warnings.push(format!(
+            "all {sites_run} aarch64 call-site emulations failed; \
+             no additional strings recovered"
+        ));
+    }
+
+    let _ = want_tight; // tight classification on AArch64 is pattern-matcher-only for now
+
+    if attempts > 0 && errors == attempts {
+        out.warnings.push(format!(
+            "all {attempts} aarch64 candidate emulations failed; \
+             no decoded strings recovered"
+        ));
+    }
+
+    Ok(())
+}
+
+/// True when at least one of X0..X7 resolved to a concrete value.
+/// Used to skip call-site runs that would just duplicate the
+/// brute-force fuzzer's all-Unknown defaults.
+#[cfg(feature = "unicorn")]
+fn any_resolved(regs: &crate::aarch64_callsite::ResolvedRegsAarch64) -> bool {
+    regs.x0.is_known()
+        || regs.x1.is_known()
+        || regs.x2.is_known()
+        || regs.x3.is_known()
+        || regs.x4.is_known()
+        || regs.x5.is_known()
+        || regs.x6.is_known()
+        || regs.x7.is_known()
+}
+
+/// Translate AArch64-resolved register values into the driver's
+/// arch-agnostic `ArgSet` shape. The driver's `setup_call_frame`
+/// already maps `args.rdi → X0`, `args.rsi → X1`, … so we mirror
+/// that ordering here.
+#[cfg(feature = "unicorn")]
+fn aarch64_resolved_to_argset(
+    layout: &crate::driver::MemoryLayout,
+    regs: crate::aarch64_callsite::ResolvedRegsAarch64,
+) -> crate::driver::ArgSet {
+    let scratch = layout.scratch_base;
+    let secondary = layout.secondary_ptr();
+    crate::driver::ArgSet {
+        rdi: regs.x0.or(scratch),
+        rsi: regs.x1.or(secondary),
+        rdx: regs.x2.or(64),
+        rcx: regs.x3.or(scratch),
+        r8: regs.x4.or(secondary),
+        r9: regs.x5.or(64),
+    }
 }

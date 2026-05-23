@@ -27,12 +27,30 @@ use strix_core::Result;
 use strix_format::ParsedInput;
 use unicorn_engine::{Arch, Mode, Prot, RegisterX86, Unicorn};
 
-/// An x86/x64 emulator built over an already-parsed binary.
+/// Which ISA the emulator was constructed for. Used by the driver
+/// to pick the right ABI / register set / stub layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmuArch {
+    /// 32-bit x86.
+    X86_32,
+    /// 64-bit x86 (AMD64).
+    X86_64,
+    /// 64-bit ARM (AArch64).
+    Aarch64,
+}
+
+/// A CPU emulator built over an already-parsed binary.
+///
+/// Supports x86 (32/64) and AArch64. The arch is picked at
+/// construction from `parsed.metadata.arch` and recorded on the
+/// emulator so the driver can dispatch ABI-specific setup.
 pub struct CpuEmulator {
     /// The underlying Unicorn engine instance.
     pub uc: Unicorn<'static, ()>,
     /// 32 or 64.
     pub bits: u8,
+    /// Which ISA we're running.
+    pub arch: EmuArch,
 }
 
 impl CpuEmulator {
@@ -40,13 +58,24 @@ impl CpuEmulator {
     /// shellcode tests; production callers should use
     /// [`CpuEmulator::from_parsed`] instead.
     pub fn new_blank(bits: u8) -> Result<Self> {
-        let (arch, mode) = match bits {
-            32 => (Arch::X86, Mode::MODE_32),
-            _ => (Arch::X86, Mode::MODE_64),
+        let arch = if bits == 32 {
+            EmuArch::X86_32
+        } else {
+            EmuArch::X86_64
         };
-        let uc = Unicorn::new(arch, mode)
+        Self::new_blank_for(arch)
+    }
+
+    /// Construct a blank emulator for a specific architecture.
+    pub fn new_blank_for(arch: EmuArch) -> Result<Self> {
+        let (uc_arch, mode, bits) = match arch {
+            EmuArch::X86_32 => (Arch::X86, Mode::MODE_32, 32u8),
+            EmuArch::X86_64 => (Arch::X86, Mode::MODE_64, 64u8),
+            EmuArch::Aarch64 => (Arch::ARM64, Mode::LITTLE_ENDIAN, 64u8),
+        };
+        let uc = Unicorn::new(uc_arch, mode)
             .map_err(|e| strix_core::Error::Other(format!("unicorn init failed: {e:?}")))?;
-        Ok(Self { uc, bits })
+        Ok(Self { uc, bits, arch })
     }
 
     /// Construct an emulator and map the parsed binary's sections into
@@ -60,7 +89,12 @@ impl CpuEmulator {
     pub fn from_parsed(input: &[u8], parsed: &ParsedInput) -> Result<Self> {
         const PAGE: u64 = 0x1000;
         let bits = parsed.metadata.bits.unwrap_or(64);
-        let mut emu = Self::new_blank(bits)?;
+        let arch = match (parsed.metadata.arch.as_deref(), bits) {
+            (Some("aarch64"), _) => EmuArch::Aarch64,
+            (_, 32) => EmuArch::X86_32,
+            _ => EmuArch::X86_64,
+        };
+        let mut emu = Self::new_blank_for(arch)?;
 
         // Pass 1: accumulate per-page permission unions.
         let mut page_perms: BTreeMap<u64, Prot> = BTreeMap::new();
@@ -188,6 +222,24 @@ impl CpuEmulator {
             .map_err(|e| strix_core::Error::Other(format!("unicorn reg_write failed: {e:?}")))
     }
 
+    /// Read an AArch64 register.
+    pub fn read_reg_arm64(&self, reg: unicorn_engine::RegisterARM64) -> Result<u64> {
+        self.uc
+            .reg_read(reg)
+            .map_err(|e| strix_core::Error::Other(format!("unicorn reg_read failed: {e:?}")))
+    }
+
+    /// Write an AArch64 register.
+    pub fn write_reg_arm64(
+        &mut self,
+        reg: unicorn_engine::RegisterARM64,
+        value: u64,
+    ) -> Result<()> {
+        self.uc
+            .reg_write(reg, value)
+            .map_err(|e| strix_core::Error::Other(format!("unicorn reg_write failed: {e:?}")))
+    }
+
     /// Read `len` bytes from emulated memory.
     pub fn read_mem(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
@@ -276,5 +328,33 @@ mod tests {
         emu.run_until(TEXT_VA, TEXT_VA + bytes.len() as u64, 0, 1)
             .expect("emu_start");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0x12345678);
+    }
+
+    /// Smoke test the AArch64 backend: load a known immediate into X0,
+    /// run one instruction, verify the register.
+    #[test]
+    fn unicorn_smoke_test_aarch64_mov() {
+        use unicorn_engine::RegisterARM64;
+
+        const CODE_BASE: u64 = 0x1000;
+        // movz x0, #0x5678; movk x0, #0x1234, lsl #16  (8 bytes)
+        // movz x0, #0x5678         → instr word 0xD28ACF00 → 00 CF 8A D2 LE
+        // movk x0, #0x1234, lsl 16 → instr word 0xF2A24680 → 80 46 A2 F2 LE
+        let code: &[u8] = &[
+            0x00, 0xCF, 0x8A, 0xD2, // movz x0, #0x5678
+            0x80, 0x46, 0xA2, 0xF2, // movk x0, #0x1234, lsl #16
+        ];
+
+        let mut emu = CpuEmulator::new_blank_for(EmuArch::Aarch64).expect("aarch64 emu init");
+        emu.uc
+            .mem_map(CODE_BASE, 0x1000, Prot::READ | Prot::EXEC)
+            .expect("map code");
+        emu.write_mem(CODE_BASE, code).expect("write code");
+
+        emu.run_until(CODE_BASE, CODE_BASE + code.len() as u64, 0, 2)
+            .expect("emu_start aarch64");
+
+        let x0 = emu.read_reg_arm64(RegisterARM64::X0).expect("read x0");
+        assert_eq!(x0, 0x12345678, "X0 should hold the assembled immediate");
     }
 }

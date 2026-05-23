@@ -178,7 +178,7 @@ impl<'a> AArch64Analyzer<'a> {
         block_worklist.push_back(entry);
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
         let mut callees: BTreeSet<u64> = BTreeSet::new();
-        let imported_callees: BTreeSet<u64> = BTreeSet::new();
+        let mut imported_callees: BTreeSet<u64> = BTreeSet::new();
 
         while let Some(block_start) = block_worklist.pop_front() {
             if blocks.contains_key(&block_start) {
@@ -222,7 +222,17 @@ impl<'a> AArch64Analyzer<'a> {
                     Op::BL => {
                         kind = BlockKind::Call;
                         if let Some(t) = direct_branch_target(&insn) {
-                            callees.insert(t);
+                            // If the target is a PLT thunk, classify
+                            // the call as an imported callee rather
+                            // than a direct one — same treatment as
+                            // the x86 path. We track the GOT VA so
+                            // the heuristic + driver can match against
+                            // `parsed.imports[*].iat_va`.
+                            if let Some(got_va) = self.is_plt_thunk(t) {
+                                imported_callees.insert(got_va);
+                            } else {
+                                callees.insert(t);
+                            }
                         }
                         successors.push(block_end);
                         block_worklist.push_back(block_end);
@@ -308,6 +318,106 @@ impl<'a> AArch64Analyzer<'a> {
             callees,
             imported_callees,
         })
+    }
+
+    /// If `va` looks like an AArch64 PLT-style import thunk, return
+    /// the GOT entry VA the thunk dispatches through. The GOT VA is
+    /// matched against `parsed.imports[*].iat_va` by the caller.
+    ///
+    /// Canonical AArch64 PLT thunk (12 bytes, 3 instructions):
+    ///
+    /// ```text
+    ///   adrp x16, page_of_got      ; PC-relative page of the GOT entry
+    ///   ldr  x16, [x16, #lo12_off] ; load the runtime-resolved address
+    ///   br   x16                    ; tail-call into the import
+    /// ```
+    ///
+    /// We accept any destination register so long as the same
+    /// register is used across all three instructions. macOS dyld
+    /// lazy stubs in `__stubs` follow the same shape, just pointing
+    /// into `__la_symbol_ptr` instead of `.got.plt`.
+    ///
+    /// Returns `None` if the bytes don't match the shape or the
+    /// resolved GOT VA isn't in our imports table.
+    pub fn is_plt_thunk(&self, va: u64) -> Option<u64> {
+        let bytes = self.bytes_at_va(va)?;
+        if bytes.len() < 12 {
+            return None;
+        }
+        let w0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let w1 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let w2 = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let i0 = bad64::decode(w0, va).ok()?;
+        let i1 = bad64::decode(w1, va + 4).ok()?;
+        let i2 = bad64::decode(w2, va + 8).ok()?;
+
+        // adrp xN, page  →  xN := PC-page + (imm21 << 12)
+        if i0.op() != Op::ADRP {
+            return None;
+        }
+        let ops0 = i0.operands();
+        let (adrp_dst, page) = match (ops0.first()?, ops0.get(1)?) {
+            (Operand::Reg { reg, .. }, Operand::Label(imm)) => {
+                let dst = full_reg(*reg);
+                let p = match imm {
+                    Imm::Unsigned(v) => *v,
+                    Imm::Signed(v) => *v as u64,
+                };
+                (dst, p)
+            }
+            _ => return None,
+        };
+
+        // ldr xN, [xN, #imm]  (same xN)
+        if i1.op() != Op::LDR {
+            return None;
+        }
+        let ops1 = i1.operands();
+        let ldr_dst = match ops1.first()? {
+            Operand::Reg { reg, .. } => full_reg(*reg),
+            _ => return None,
+        };
+        if ldr_dst != adrp_dst {
+            return None;
+        }
+        let ldr_off: i64 = match ops1.get(1)? {
+            Operand::MemReg(reg) => {
+                if full_reg(*reg) != adrp_dst {
+                    return None;
+                }
+                0
+            }
+            Operand::MemOffset { reg, offset, .. } => {
+                if full_reg(*reg) != adrp_dst {
+                    return None;
+                }
+                match offset {
+                    Imm::Unsigned(v) => *v as i64,
+                    Imm::Signed(v) => *v,
+                }
+            }
+            _ => return None,
+        };
+
+        // br xN  (same xN)
+        if i2.op() != Op::BR {
+            return None;
+        }
+        let ops2 = i2.operands();
+        let br_dst = match ops2.first()? {
+            Operand::Reg { reg, .. } => full_reg(*reg),
+            _ => return None,
+        };
+        if br_dst != adrp_dst {
+            return None;
+        }
+
+        let got_va = (page as i64).wrapping_add(ldr_off) as u64;
+        if self.parsed.imports.iter().any(|imp| imp.iat_va == got_va) {
+            Some(got_va)
+        } else {
+            None
+        }
     }
 }
 
@@ -398,5 +508,132 @@ pub(crate) fn full_reg(r: Reg) -> Reg {
         W30 | X30 => X30,
         WSP | SP => SP,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strix_core::InputMetadata;
+    use strix_format::{Import, ParsedInput, Section};
+
+    /// Caller at 0x1000 bl's into a PLT thunk at 0x1008. The thunk
+    /// is `adrp x16, 0x2000; ldr x16, [x16, #0]; br x16` — a textbook
+    /// AArch64 PLT shape. With the matching GOT VA (0x2000) registered
+    /// in `parsed.imports`, the analyzer should classify the BL target
+    /// as an imported callee rather than a direct one.
+    #[test]
+    fn analyze_function_recognizes_aarch64_plt_thunk() {
+        // 0x1000  bl 0x1008                  → 0x94000002  → 02 00 00 94
+        // 0x1004  ret                        → 0xD65F03C0  → C0 03 5F D6
+        // 0x1008  adrp x16, page=0x2000      → 0xB0000010  → 10 00 00 B0
+        // 0x100C  ldr x16, [x16, #0]         → 0xF9400210  → 10 02 40 F9
+        // 0x1010  br x16                     → 0xD61F0200  → 00 02 1F D6
+        let bytes: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x94, // bl 0x1008
+            0xC0, 0x03, 0x5F, 0xD6, // ret
+            0x10, 0x00, 0x00, 0xB0, // adrp x16, 0x2000
+            0x10, 0x02, 0x40, 0xF9, // ldr  x16, [x16, #0]
+            0x00, 0x02, 0x1F, 0xD6, // br   x16
+        ];
+        const TEXT_VA: u64 = 0x1000;
+        const GOT_VA: u64 = 0x2000;
+
+        let parsed = ParsedInput {
+            metadata: InputMetadata {
+                format: "sc64".into(),
+                arch: Some("aarch64".into()),
+                bits: Some(64),
+                size: bytes.len() as u64,
+                language: None,
+            },
+            sections: vec![Section {
+                name: ".text".into(),
+                file_offset: 0,
+                file_size: bytes.len() as u64,
+                virtual_address: TEXT_VA,
+                executable: true,
+                writable: false,
+            }],
+            entry: Some(TEXT_VA),
+            warnings: Vec::new(),
+            scan_window: None,
+            imports: vec![Import {
+                library: "libtest.so".into(),
+                name: "imported_fn".into(),
+                iat_va: GOT_VA,
+            }],
+            symbols: Default::default(),
+        };
+
+        let analyzer = AArch64Analyzer::new(&bytes, &parsed);
+        let f = analyzer
+            .analyze_function(TEXT_VA)
+            .expect("analyze_function");
+        assert!(
+            f.imported_callees.contains(&GOT_VA),
+            "expected imported_callees to contain {GOT_VA:#x}; got {:#x?}",
+            f.imported_callees
+        );
+        // PLT-thunk target should NOT also appear in `callees` — it's
+        // an import, not a direct callee.
+        assert!(
+            !f.callees.contains(&0x1008),
+            "PLT thunk address should not be in direct callees; got {:#x?}",
+            f.callees
+        );
+    }
+
+    /// Sanity check: when imports is empty, the same call shape is
+    /// classified as a direct callee (no false positives on functions
+    /// that happen to start with adrp+ldr+br).
+    #[test]
+    fn analyze_function_without_matching_import_keeps_direct_callee() {
+        let bytes: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x94, // bl 0x1008
+            0xC0, 0x03, 0x5F, 0xD6, // ret
+            0x10, 0x00, 0x00, 0xB0, // adrp x16, 0x2000
+            0x10, 0x02, 0x40, 0xF9, // ldr  x16, [x16, #0]
+            0x00, 0x02, 0x1F, 0xD6, // br   x16
+        ];
+        const TEXT_VA: u64 = 0x1000;
+
+        let parsed = ParsedInput {
+            metadata: InputMetadata {
+                format: "sc64".into(),
+                arch: Some("aarch64".into()),
+                bits: Some(64),
+                size: bytes.len() as u64,
+                language: None,
+            },
+            sections: vec![Section {
+                name: ".text".into(),
+                file_offset: 0,
+                file_size: bytes.len() as u64,
+                virtual_address: TEXT_VA,
+                executable: true,
+                writable: false,
+            }],
+            entry: Some(TEXT_VA),
+            warnings: Vec::new(),
+            scan_window: None,
+            imports: Vec::new(), // no imports → no PLT match
+            symbols: Default::default(),
+        };
+
+        let analyzer = AArch64Analyzer::new(&bytes, &parsed);
+        let f = analyzer
+            .analyze_function(TEXT_VA)
+            .expect("analyze_function");
+        assert!(
+            f.callees.contains(&0x1008),
+            "with no imports, target should be a direct callee; got {:#x?}",
+            f.callees
+        );
+        assert!(
+            f.imported_callees.is_empty(),
+            "no imports should produce no imported callees; got {:#x?}",
+            f.imported_callees
+        );
     }
 }

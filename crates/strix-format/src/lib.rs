@@ -122,6 +122,8 @@ pub fn parse(input: &[u8], hint: Option<FormatHint>) -> Result<ParsedInput> {
         FormatHint::MachO => parse_macho(input),
         FormatHint::Sc32 => Ok(parse_shellcode(input, 32)),
         FormatHint::Sc64 => Ok(parse_shellcode(input, 64)),
+        FormatHint::Sc32Arm => Ok(parse_shellcode_with_arch(input, 32, "arm".to_string())),
+        FormatHint::Sc64Arm64 => Ok(parse_shellcode_with_arch(input, 64, "aarch64".to_string())),
     }
 }
 
@@ -147,6 +149,16 @@ pub fn parse_all(input: &[u8], hint: Option<FormatHint>) -> Result<Vec<ParsedInp
         FormatHint::MachO => parse_macho_all(input),
         FormatHint::Sc32 => Ok(vec![parse_shellcode(input, 32)]),
         FormatHint::Sc64 => Ok(vec![parse_shellcode(input, 64)]),
+        FormatHint::Sc32Arm => Ok(vec![parse_shellcode_with_arch(
+            input,
+            32,
+            "arm".to_string(),
+        )]),
+        FormatHint::Sc64Arm64 => Ok(vec![parse_shellcode_with_arch(
+            input,
+            64,
+            "aarch64".to_string(),
+        )]),
     }
 }
 
@@ -539,6 +551,12 @@ fn cputype_name(ct: u32) -> &'static str {
 
 fn parse_shellcode(input: &[u8], bits: u8) -> ParsedInput {
     let arch = if bits == 64 { "x86_64" } else { "x86" }.to_string();
+    parse_shellcode_with_arch(input, bits, arch)
+}
+
+/// Same as [`parse_shellcode`] but with a caller-supplied arch name.
+/// Used by the ARM / AArch64 shellcode entrypoints.
+fn parse_shellcode_with_arch(input: &[u8], bits: u8, arch: String) -> ParsedInput {
     let one_section = Section {
         name: "shellcode".to_string(),
         file_offset: 0,

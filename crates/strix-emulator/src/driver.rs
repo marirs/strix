@@ -30,9 +30,9 @@ use std::sync::{Arc, Mutex};
 
 use strix_core::{Encoding, Result};
 use strix_format::ParsedInput;
-use unicorn_engine::{HookType, Prot, RegisterX86, Unicorn};
+use unicorn_engine::{HookType, Prot, RegisterARM64, RegisterX86, Unicorn};
 
-use crate::emulator::CpuEmulator;
+use crate::emulator::{CpuEmulator, EmuArch};
 
 /// Layout of all emulator-owned memory regions.
 #[derive(Debug, Clone, Copy)]
@@ -275,9 +275,28 @@ impl EmulationDriver {
                 strix_core::Error::Other(format!("unicorn mem_map stub region failed: {e:?}"))
             })?;
         // Fill the stub region with `ret` instructions. The hook sets
-        // RAX and lets the natural `ret` pop the saved return
-        // address — much simpler than trying to manually unwind.
-        let stub_filler = vec![0xC3u8; layout.stub_size as usize];
+        // the architectural return register and lets the natural `ret`
+        // jump back to the caller — much simpler than manually unwinding.
+        //
+        //  - x86 / x86_64: `ret` is the single byte `0xC3` (pops RIP/EIP).
+        //  - AArch64:     `ret` is the 4-byte instruction `0xD65F03C0`
+        //                 which branches to X30 (LR).
+        let stub_filler: Vec<u8> = match emu.arch {
+            EmuArch::X86_32 | EmuArch::X86_64 => vec![0xC3u8; layout.stub_size as usize],
+            EmuArch::Aarch64 => {
+                let mut v = Vec::with_capacity(layout.stub_size as usize);
+                // `ret` = 0xD65F03C0; little-endian bytes:
+                let ret_bytes = [0xC0u8, 0x03, 0x5F, 0xD6];
+                for _ in 0..(layout.stub_size / 4) {
+                    v.extend_from_slice(&ret_bytes);
+                }
+                // Pad any tail (stub_size not divisible by 4) with zeros.
+                while v.len() < layout.stub_size as usize {
+                    v.push(0);
+                }
+                v
+            }
+        };
         emu.uc
             .mem_write(layout.stub_base, &stub_filler)
             .map_err(|e| strix_core::Error::Other(format!("stub region fill failed: {e:?}")))?;
@@ -322,14 +341,14 @@ impl EmulationDriver {
 
         // Install a Unicorn code hook over the stub region. Each time
         // execution enters a stub address, the closure handles the
-        // import and "returns" by popping the saved return address
-        // off the stack and writing it into RIP.
+        // import and "returns" via the natural `ret` instruction at
+        // that stub slot (filled above).
         let state_for_hook = Arc::clone(&state);
-        let bits_for_hook = bits;
+        let arch_for_hook = emu.arch;
         emu.uc
             .add_code_hook(layout.stub_base, stub_end, move |uc, addr, _size| {
                 if let Ok(mut st) = state_for_hook.lock() {
-                    handle_stub(uc, &mut st, addr, bits_for_hook);
+                    handle_stub(uc, &mut st, addr, arch_for_hook);
                 }
             })
             .map_err(|e| {
@@ -563,6 +582,66 @@ impl EmulationDriver {
         Ok(res)
     }
 
+    /// Architecture-aware call-frame setup. Loads `args` into the
+    /// caller-arg registers / stack slots for the right ABI, sets
+    /// SP/FP to point into our pre-mapped stack region, and installs
+    /// the sentinel return target (`layout.magic_return`) — either
+    /// pushed onto the stack (x86) or written into LR/X30 (AArch64).
+    fn setup_call_frame(&mut self, args: &ArgSet) -> Result<()> {
+        let stack_top = self.layout.stack_base + self.layout.stack_size - 0x100;
+        match self.emu.arch {
+            EmuArch::X86_64 => {
+                let rsp = stack_top - 8;
+                self.emu
+                    .write_mem(rsp, &self.layout.magic_return.to_le_bytes())?;
+                self.emu.write_reg(RegisterX86::RSP, rsp)?;
+                self.emu.write_reg(RegisterX86::RBP, rsp)?;
+                self.emu.write_reg(RegisterX86::RDI, args.rdi)?;
+                self.emu.write_reg(RegisterX86::RSI, args.rsi)?;
+                self.emu.write_reg(RegisterX86::RDX, args.rdx)?;
+                self.emu.write_reg(RegisterX86::RCX, args.rcx)?;
+                self.emu.write_reg(RegisterX86::R8, args.r8)?;
+                self.emu.write_reg(RegisterX86::R9, args.r9)?;
+            }
+            EmuArch::X86_32 => {
+                let rsp = stack_top - 4;
+                let m32 = self.layout.magic_return as u32;
+                self.emu.write_mem(rsp, &m32.to_le_bytes())?;
+                self.emu.write_reg(RegisterX86::ESP, rsp)?;
+                self.emu.write_reg(RegisterX86::EBP, rsp)?;
+                // x86 cdecl/stdcall: first two args on the stack just
+                // past the return address. We mirror rdi/rsi.
+                let arg1_pos = rsp - 8;
+                let arg2_pos = rsp - 4;
+                self.emu
+                    .write_mem(arg1_pos, &(args.rdi as u32).to_le_bytes())?;
+                self.emu
+                    .write_mem(arg2_pos, &(args.rsi as u32).to_le_bytes())?;
+            }
+            EmuArch::Aarch64 => {
+                // AAPCS64: first 8 integer args in X0..X7. SP must be
+                // 16-byte aligned at function entry. LR holds the
+                // return address; we don't push it onto the stack —
+                // the callee will if it wants.
+                let sp = stack_top & !0xFu64;
+                self.emu.write_reg_arm64(RegisterARM64::SP, sp)?;
+                self.emu.write_reg_arm64(RegisterARM64::FP, sp)?;
+                self.emu
+                    .write_reg_arm64(RegisterARM64::LR, self.layout.magic_return)?;
+                // Reuse the ArgSet fields as a simple positional mapping.
+                self.emu.write_reg_arm64(RegisterARM64::X0, args.rdi)?;
+                self.emu.write_reg_arm64(RegisterARM64::X1, args.rsi)?;
+                self.emu.write_reg_arm64(RegisterARM64::X2, args.rdx)?;
+                self.emu.write_reg_arm64(RegisterARM64::X3, args.rcx)?;
+                self.emu.write_reg_arm64(RegisterARM64::X4, args.r8)?;
+                self.emu.write_reg_arm64(RegisterARM64::X5, args.r9)?;
+                self.emu.write_reg_arm64(RegisterARM64::X6, 0)?;
+                self.emu.write_reg_arm64(RegisterARM64::X7, 0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run `entry` once with the given args, but install
     /// `scratch_state` as the initial scratch contents instead of
     /// the usual zero fill. Heap and stack are still zeroed.
@@ -573,7 +652,6 @@ impl EmulationDriver {
         args: &ArgSet,
         scratch_state: &[u8],
     ) -> Result<RunResult> {
-        let bits = self.emu.bits;
         let zero_heap = vec![0u8; self.layout.heap_size as usize];
         let zero_stack = vec![0u8; self.layout.stack_size as usize];
         self.emu
@@ -586,32 +664,7 @@ impl EmulationDriver {
             st.mem_writes.clear();
             st.current_ip = 0;
         }
-        let ptr_size: u64 = if bits == 64 { 8 } else { 4 };
-        let stack_top = self.layout.stack_base + self.layout.stack_size - 0x100;
-        let rsp = stack_top - ptr_size;
-        if bits == 64 {
-            self.emu
-                .write_mem(rsp, &self.layout.magic_return.to_le_bytes())?;
-            self.emu.write_reg(RegisterX86::RSP, rsp)?;
-            self.emu.write_reg(RegisterX86::RBP, rsp)?;
-            self.emu.write_reg(RegisterX86::RDI, args.rdi)?;
-            self.emu.write_reg(RegisterX86::RSI, args.rsi)?;
-            self.emu.write_reg(RegisterX86::RDX, args.rdx)?;
-            self.emu.write_reg(RegisterX86::RCX, args.rcx)?;
-            self.emu.write_reg(RegisterX86::R8, args.r8)?;
-            self.emu.write_reg(RegisterX86::R9, args.r9)?;
-        } else {
-            let m32 = self.layout.magic_return as u32;
-            self.emu.write_mem(rsp, &m32.to_le_bytes())?;
-            self.emu.write_reg(RegisterX86::ESP, rsp)?;
-            self.emu.write_reg(RegisterX86::EBP, rsp)?;
-            let arg1_pos = rsp - 8;
-            let arg2_pos = rsp - 4;
-            self.emu
-                .write_mem(arg1_pos, &(args.rdi as u32).to_le_bytes())?;
-            self.emu
-                .write_mem(arg2_pos, &(args.rsi as u32).to_le_bytes())?;
-        }
+        self.setup_call_frame(args)?;
         let execution = self
             .emu
             .run_until(entry, self.layout.magic_return, 0, max_steps);
@@ -678,8 +731,6 @@ impl EmulationDriver {
     /// Run `entry` once with the given `args`, returning the printable
     /// runs newly visible in scratch and stack.
     pub fn run_function(&mut self, entry: u64, max_steps: u64, args: &ArgSet) -> Result<RunResult> {
-        let bits = self.emu.bits;
-
         // Zero scratch + heap + stack so any printable byte left
         // there is a genuine write from this run.
         let zero_scratch = vec![0u8; self.layout.scratch_size as usize];
@@ -700,36 +751,7 @@ impl EmulationDriver {
             st.current_ip = 0;
         }
 
-        // Push the sentinel return address.
-        let ptr_size: u64 = if bits == 64 { 8 } else { 4 };
-        let stack_top = self.layout.stack_base + self.layout.stack_size - 0x100;
-        let rsp = stack_top - ptr_size;
-
-        if bits == 64 {
-            self.emu
-                .write_mem(rsp, &self.layout.magic_return.to_le_bytes())?;
-            self.emu.write_reg(RegisterX86::RSP, rsp)?;
-            self.emu.write_reg(RegisterX86::RBP, rsp)?;
-            self.emu.write_reg(RegisterX86::RDI, args.rdi)?;
-            self.emu.write_reg(RegisterX86::RSI, args.rsi)?;
-            self.emu.write_reg(RegisterX86::RDX, args.rdx)?;
-            self.emu.write_reg(RegisterX86::RCX, args.rcx)?;
-            self.emu.write_reg(RegisterX86::R8, args.r8)?;
-            self.emu.write_reg(RegisterX86::R9, args.r9)?;
-        } else {
-            let m32 = self.layout.magic_return as u32;
-            self.emu.write_mem(rsp, &m32.to_le_bytes())?;
-            self.emu.write_reg(RegisterX86::ESP, rsp)?;
-            self.emu.write_reg(RegisterX86::EBP, rsp)?;
-            // x86 cdecl/stdcall: args on the stack just below the
-            // return address.
-            let arg1_pos = rsp - 8;
-            let arg2_pos = rsp - 4;
-            self.emu
-                .write_mem(arg1_pos, &(args.rdi as u32).to_le_bytes())?;
-            self.emu
-                .write_mem(arg2_pos, &(args.rsi as u32).to_le_bytes())?;
-        }
+        self.setup_call_frame(args)?;
 
         let execution = self
             .emu
@@ -912,7 +934,7 @@ fn is_printable(b: u8) -> bool {
 /// * Anything else — return 0 and clean-return. This is the right
 ///   behavior for the calls a decoder doesn't care about (e.g.,
 ///   `GetLastError`); we just don't fault.
-fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, bits: u8) {
+fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, arch: EmuArch) {
     // Look up the import metadata for this stub address.
     let info = match state.stubs.get(&addr).cloned() {
         Some(i) => i,
@@ -920,30 +942,47 @@ fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, bits:
     };
     let name_lc = info.name.to_ascii_lowercase();
 
-    // x86_64 Win64 calling convention: first 4 args in rcx, rdx, r8, r9.
-    // Read on demand; pull a 32-bit ABI fallback for x86.
+    // Read an argument by positional index, branching on ABI:
+    //  - x86_64 (Win64): RCX, RDX, R8, R9, then stack.
+    //  - x86 (cdecl/stdcall): [esp + 4 + 4*idx].
+    //  - AArch64 (AAPCS64): X0..X7, then stack.
     let arg = |uc: &mut Unicorn<'_, ()>, idx: usize| -> u64 {
-        if bits == 64 {
-            let reg = match idx {
-                0 => RegisterX86::RCX,
-                1 => RegisterX86::RDX,
-                2 => RegisterX86::R8,
-                3 => RegisterX86::R9,
-                _ => return 0,
-            };
-            uc.reg_read(reg).unwrap_or(0)
-        } else {
-            // x86 stdcall/cdecl: args on the stack just past the
-            // return address. `[esp + 4 + 4*idx]`.
-            let esp = uc.reg_read(RegisterX86::ESP).unwrap_or(0);
-            let mut buf = [0u8; 4];
-            if uc
-                .mem_read(esp.saturating_add(4 + 4 * idx as u64), &mut buf)
-                .is_err()
-            {
-                return 0;
+        match arch {
+            EmuArch::X86_64 => {
+                let reg = match idx {
+                    0 => RegisterX86::RCX,
+                    1 => RegisterX86::RDX,
+                    2 => RegisterX86::R8,
+                    3 => RegisterX86::R9,
+                    _ => return 0,
+                };
+                uc.reg_read(reg).unwrap_or(0)
             }
-            u32::from_le_bytes(buf) as u64
+            EmuArch::X86_32 => {
+                let esp = uc.reg_read(RegisterX86::ESP).unwrap_or(0);
+                let mut buf = [0u8; 4];
+                if uc
+                    .mem_read(esp.saturating_add(4 + 4 * idx as u64), &mut buf)
+                    .is_err()
+                {
+                    return 0;
+                }
+                u32::from_le_bytes(buf) as u64
+            }
+            EmuArch::Aarch64 => {
+                let reg = match idx {
+                    0 => RegisterARM64::X0,
+                    1 => RegisterARM64::X1,
+                    2 => RegisterARM64::X2,
+                    3 => RegisterARM64::X3,
+                    4 => RegisterARM64::X4,
+                    5 => RegisterARM64::X5,
+                    6 => RegisterARM64::X6,
+                    7 => RegisterARM64::X7,
+                    _ => return 0,
+                };
+                uc.reg_read(reg).unwrap_or(0)
+            }
         }
     };
 
@@ -1116,15 +1155,20 @@ fn handle_stub(uc: &mut Unicorn<'_, ()>, state: &mut HookState, addr: u64, bits:
     };
 
     // Set the architectural return register. The natural `ret`
-    // instruction at the stub address (we filled the region with
-    // 0xC3 bytes at setup) will handle the function-epilogue dance
-    // of popping the saved return address into RIP/EIP.
-    let rax_reg = if bits == 64 {
-        RegisterX86::RAX
-    } else {
-        RegisterX86::EAX
-    };
-    let _ = uc.reg_write(rax_reg, return_value);
+    // instruction at the stub address (we filled the stub region
+    // with `ret` instructions at setup) handles the
+    // function-epilogue dance of jumping back to the caller.
+    match arch {
+        EmuArch::X86_64 => {
+            let _ = uc.reg_write(RegisterX86::RAX, return_value);
+        }
+        EmuArch::X86_32 => {
+            let _ = uc.reg_write(RegisterX86::EAX, return_value);
+        }
+        EmuArch::Aarch64 => {
+            let _ = uc.reg_write(RegisterARM64::X0, return_value);
+        }
+    }
 }
 
 /// Bump-allocate `size` bytes from the fake heap, rounded up to a
@@ -1279,10 +1323,14 @@ mod tests {
     use strix_format::{ParsedInput, Section};
 
     fn parsed_for(bytes: &[u8], va: u64) -> ParsedInput {
+        parsed_for_arch(bytes, va, "x86_64")
+    }
+
+    fn parsed_for_arch(bytes: &[u8], va: u64, arch: &str) -> ParsedInput {
         ParsedInput {
             metadata: InputMetadata {
                 format: "sc64".into(),
-                arch: Some("x86_64".into()),
+                arch: Some(arch.into()),
                 bits: Some(64),
                 size: bytes.len() as u64,
                 language: None,
@@ -1301,6 +1349,52 @@ mod tests {
             imports: Vec::new(),
             symbols: Default::default(),
         }
+    }
+
+    /// End-to-end AArch64 smoke test: a function that writes "HELLO"
+    /// bytewise to its first arg pointer (X0) and returns via X30.
+    ///
+    /// Each pair of instructions is `movz w1, #c; strb w1, [x0, #n]`.
+    /// MOVZ on a W-reg zeros the upper 32 bits of X1 then writes the
+    /// immediate to the low 16; STRB stores W1's low byte at [X0+n].
+    /// The function tail is `ret` (branch to X30, which the driver
+    /// preloads with `layout.magic_return`).
+    #[test]
+    fn driver_recovers_string_aarch64() {
+        let code: Vec<u8> = vec![
+            // movz w1, #'H' (=0x48)        → 0x52800901
+            0x01, 0x09, 0x80, 0x52, // strb w1, [x0, #0]            → 0x39000001
+            0x01, 0x00, 0x00, 0x39, // movz w1, #'E' (=0x45)        → 0x528008A1
+            0xA1, 0x08, 0x80, 0x52, // strb w1, [x0, #1]            → 0x39000401
+            0x01, 0x04, 0x00, 0x39, // movz w1, #'L' (=0x4C)        → 0x52800981
+            0x81, 0x09, 0x80, 0x52, // strb w1, [x0, #2]            → 0x39000801
+            0x01, 0x08, 0x00, 0x39, // strb w1, [x0, #3]            → 0x39000C01
+            0x01, 0x0C, 0x00, 0x39, // movz w1, #'O' (=0x4F)        → 0x528009E1
+            0xE1, 0x09, 0x80, 0x52, // strb w1, [x0, #4]            → 0x39001001
+            0x01, 0x10, 0x00, 0x39, // ret                          → 0xD65F03C0
+            0xC0, 0x03, 0x5F, 0xD6,
+        ];
+        const TEXT_VA: u64 = 0x1000;
+        let parsed = parsed_for_arch(&code, TEXT_VA, "aarch64");
+        let mut driver = EmulationDriver::new(&code, &parsed).expect("aarch64 driver init");
+        let args = ArgSet::basic(&driver.layout);
+        let result = driver
+            .run_function(TEXT_VA, 1_000, &args)
+            .expect("aarch64 run");
+        assert!(
+            result.execution_ok,
+            "aarch64 emulation failed: {:?}",
+            result.error
+        );
+        let strs: Vec<&str> = result.recovered.iter().map(|r| r.value.as_str()).collect();
+        assert!(strs.contains(&"HELLO"), "got {:?}", strs);
+        let hello = result
+            .recovered
+            .iter()
+            .find(|r| r.value == "HELLO")
+            .unwrap();
+        assert_eq!(hello.kind, RecoveredKind::Decoded);
+        assert_eq!(hello.address, driver.layout.scratch_base);
     }
 
     #[test]

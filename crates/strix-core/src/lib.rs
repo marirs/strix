@@ -250,10 +250,14 @@ pub enum FormatHint {
     Elf,
     /// Mach-O (macOS).
     MachO,
-    /// Raw 32-bit shellcode.
+    /// Raw 32-bit shellcode (x86).
     Sc32,
-    /// Raw 64-bit shellcode.
+    /// Raw 64-bit shellcode (x86_64).
     Sc64,
+    /// Raw 32-bit ARM shellcode.
+    Sc32Arm,
+    /// Raw 64-bit AArch64 shellcode.
+    Sc64Arm64,
 }
 
 /// Metadata about the analyzed input file.
