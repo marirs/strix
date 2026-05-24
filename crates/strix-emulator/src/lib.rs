@@ -313,12 +313,14 @@ fn run_emulated_pipeline<'a>(
 
     use strix_core::Location;
 
+    use rayon::prelude::*;
+
     use crate::analyzer::CodeAnalyzer;
     use crate::callsite::{
         AbsValPub, collect_rdata_pointers, find_call_sites, make_va_reader, resolve_call_site_regs,
         resolve_call_site_regs_cross_block,
     };
-    use crate::driver::{EmulationDriver, RecoveredKind};
+    use crate::driver::{EmulationDriver, RecoveredKind, RunResult};
     use crate::heuristics::{ScoreWeights, rank_candidates, score_all};
 
     let (want_decoded, want_stack, want_tight) = want;
@@ -345,7 +347,14 @@ fn run_emulated_pipeline<'a>(
     }
 
     // 3. Emulate the top N candidates directly with our fuzzed args.
-    let mut driver = EmulationDriver::new(input, parsed)?;
+    //
+    // The driver itself isn't `Send` (Unicorn handles are tied to the
+    // thread they were created on), so we use rayon's `map_init` to
+    // build one driver per worker thread. Each driver is reused across
+    // the candidates that thread happens to be assigned. The cost is
+    // O(num_workers) driver constructions; the win is the
+    // O(num_candidates) decoder emulations run in parallel.
+    let layout = crate::driver::MemoryLayout::for_bits(parsed.metadata.bits.unwrap_or(64));
     let mut driver_errors: u32 = 0;
     let mut attempts: u32 = 0;
 
@@ -449,10 +458,25 @@ fn run_emulated_pipeline<'a>(
         .map(|(va, _)| *va)
         .collect();
 
-    for entry in &candidate_vas {
+    let brute_results: Vec<(u64, std::result::Result<RunResult, String>)> = candidate_vas
+        .par_iter()
+        .map_init(
+            || EmulationDriver::new(input, parsed),
+            |driver_res, &entry| match driver_res {
+                Ok(driver) => {
+                    match driver.run_function_fuzzed(entry, options.max_emulation_steps) {
+                        Ok(r) => (entry, Ok(r)),
+                        Err(e) => (entry, Err(e.to_string())),
+                    }
+                }
+                Err(e) => (entry, Err(e.to_string())),
+            },
+        )
+        .collect();
+    for (entry, run) in brute_results {
         attempts += 1;
-        match driver.run_function_fuzzed(*entry, options.max_emulation_steps) {
-            Ok(r) => push_recovered(r, *entry, None, out, &mut driver_errors),
+        match run {
+            Ok(r) => push_recovered(r, entry, None, out, &mut driver_errors),
             Err(_) => driver_errors += 1,
         }
     }
@@ -468,25 +492,42 @@ fn run_emulated_pipeline<'a>(
     //    We cap callers per candidate to bound test wall-clock; in
     //    practice 3 is plenty since deduped runs converge quickly.
     const MAX_CALLERS_PER_CANDIDATE: usize = 3;
-    let mut callers_attempted: u32 = 0;
     let mut callers_errors: u32 = 0;
     // Caller emulation has to walk the full prologue and any setup
     // calls (HeapAlloc, memcpy, etc.) before reaching the decoder.
     // Give it more headroom than the brute-force fuzzer's cap.
     let caller_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
-    for callee in &candidate_vas {
-        let callers: Vec<u64> = funcs
-            .iter()
-            .filter(|(caller_va, f)| *caller_va != callee && f.callees.contains(callee))
-            .map(|(va, _)| *va)
-            .take(MAX_CALLERS_PER_CANDIDATE)
-            .collect();
-        for caller in callers {
-            callers_attempted += 1;
-            match driver.run_function_fuzzed(caller, caller_step_cap) {
-                Ok(r) => push_recovered(r, caller, None, out, &mut callers_errors),
-                Err(_) => callers_errors += 1,
-            }
+    // Flatten (callee, caller) pairs once, then fan the emulations
+    // out across rayon's pool.
+    let caller_targets: Vec<u64> = candidate_vas
+        .iter()
+        .flat_map(|callee| {
+            funcs
+                .iter()
+                .filter(|(caller_va, f)| *caller_va != callee && f.callees.contains(callee))
+                .map(|(va, _)| *va)
+                .take(MAX_CALLERS_PER_CANDIDATE)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let callers_attempted = caller_targets.len() as u32;
+    let caller_results: Vec<(u64, std::result::Result<RunResult, String>)> = caller_targets
+        .par_iter()
+        .map_init(
+            || EmulationDriver::new(input, parsed),
+            |driver_res, &caller| match driver_res {
+                Ok(driver) => match driver.run_function_fuzzed(caller, caller_step_cap) {
+                    Ok(r) => (caller, Ok(r)),
+                    Err(e) => (caller, Err(e.to_string())),
+                },
+                Err(e) => (caller, Err(e.to_string())),
+            },
+        )
+        .collect();
+    for (caller, run) in caller_results {
+        match run {
+            Ok(r) => push_recovered(r, caller, None, out, &mut callers_errors),
+            Err(_) => callers_errors += 1,
         }
     }
     if callers_attempted > 0 && callers_errors == callers_attempted {
@@ -508,7 +549,6 @@ fn run_emulated_pipeline<'a>(
     //    pointing at .rdata — those don't appear in the brute-force
     //    fuzzer schedule (which always points args at scratch).
     const MAX_SITES_PER_CANDIDATE: usize = 6;
-    let mut sites_emulated: u32 = 0;
     let mut sites_yielded: u32 = 0;
     let reader = make_va_reader(input, parsed);
 
@@ -561,21 +601,34 @@ fn run_emulated_pipeline<'a>(
     // produce output (we've staged real args).
     let callsite_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
 
+    // Build the full task list serially (the dataflow analysis is
+    // cheap; emulation is what we want to fan out). Each task is
+    // either a direct run with resolved args or a prefill-then-run
+    // for one .rdata source visible from the call site.
+    const MAX_RDATA_SOURCES_PER_SITE: usize = 4;
+    const PREFILL_BYTES: usize = 256;
+    enum CallsiteTask {
+        Direct {
+            callee: u64,
+            args: crate::driver::ArgSet,
+        },
+        Prefill {
+            callee: u64,
+            args: crate::driver::ArgSet,
+            prefill: Vec<u8>,
+            source_va: u64,
+        },
+    }
+    let mut tasks: Vec<CallsiteTask> = Vec::new();
     for callee in &expanded {
         let sites = find_call_sites(&analyzer, &funcs, *callee, MAX_SITES_PER_CANDIDATE);
         for site in sites {
-            // Cross-block dataflow when we have the caller function:
-            // arg setup commonly straddles the prologue and the
-            // call's block.
             let regs = match funcs.get(&site.caller_va) {
                 Some(caller_func) => {
                     resolve_call_site_regs_cross_block(&analyzer, caller_func, site, &reader)
                 }
                 None => resolve_call_site_regs(&analyzer, site, &reader),
             };
-            // Only run if at least one argument register resolved to
-            // a concrete value — otherwise we're just duplicating the
-            // brute-force fuzzer's schedule.
             if !(regs.rcx.is_known()
                 || regs.rdx.is_known()
                 || regs.r8.is_known()
@@ -585,30 +638,11 @@ fn run_emulated_pipeline<'a>(
             {
                 continue;
             }
-            sites_emulated += 1;
-            let arg_set = resolved_to_argset(&driver.layout, regs);
-            match driver.run_function_with(*callee, callsite_step_cap, &[arg_set]) {
-                Ok(r) => {
-                    let prev_decoded = out.decoded.len();
-                    let prev_stack = out.stack.len();
-                    push_recovered(r, *callee, None, out, &mut driver_errors);
-                    if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
-                        sites_yielded += 1;
-                    }
-                }
-                Err(_) => driver_errors += 1,
-            }
-
-            // Additional pass: pre-populate scratch with bytes from
-            // each .rdata pointer visible near this call site, then
-            // run the decoder pointing rcx at scratch. Catches the
-            // common in-place pattern where the caller stages
-            // encoded bytes into a local buffer (often via inline
-            // mov-chains rather than a memcpy call) before invoking
-            // the decoder. We try up to 4 distinct sources per call
-            // site to bound wall-clock.
-            const MAX_RDATA_SOURCES_PER_SITE: usize = 4;
-            const PREFILL_BYTES: usize = 256;
+            let arg_set = resolved_to_argset(&layout, regs);
+            tasks.push(CallsiteTask::Direct {
+                callee: *callee,
+                args: arg_set,
+            });
             if let Some(caller_func) = funcs.get(&site.caller_va) {
                 let sources = collect_rdata_pointers(&analyzer, caller_func, site, parsed);
                 for src_va in sources.iter().take(MAX_RDATA_SOURCES_PER_SITE) {
@@ -616,38 +650,90 @@ fn run_emulated_pipeline<'a>(
                         continue;
                     };
                     let mut prefill_args = arg_set;
-                    // Re-point any in-rdata pointer arg at scratch
-                    // since the decoder reads from there now.
                     if matches!(regs.rcx, AbsValPub::Pointer(_)) {
-                        prefill_args.rcx = driver.layout.scratch_base;
+                        prefill_args.rcx = layout.scratch_base;
                     }
                     if matches!(regs.rdx, AbsValPub::Pointer(_)) {
-                        prefill_args.rdx = driver.layout.scratch_base;
+                        prefill_args.rdx = layout.scratch_base;
                     }
                     if matches!(regs.rsi, AbsValPub::Pointer(_)) {
-                        prefill_args.rsi = driver.layout.scratch_base;
+                        prefill_args.rsi = layout.scratch_base;
                     }
                     if matches!(regs.rdi, AbsValPub::Pointer(_)) {
-                        prefill_args.rdi = driver.layout.scratch_base;
+                        prefill_args.rdi = layout.scratch_base;
                     }
-                    match driver.run_function_with_prefill(
-                        *callee,
-                        callsite_step_cap,
-                        &prefill_args,
-                        &prefill,
-                    ) {
-                        Ok(r) => {
-                            let prev_decoded = out.decoded.len();
-                            let prev_stack = out.stack.len();
-                            push_recovered(r, *callee, Some(*src_va), out, &mut driver_errors);
-                            if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
-                                sites_yielded += 1;
-                            }
-                        }
-                        Err(_) => driver_errors += 1,
-                    }
+                    tasks.push(CallsiteTask::Prefill {
+                        callee: *callee,
+                        args: prefill_args,
+                        prefill,
+                        source_va: *src_va,
+                    });
                 }
             }
+        }
+    }
+    let sites_emulated = tasks.len() as u32;
+
+    // Fan the emulation runs out via rayon. Each worker thread gets
+    // its own driver (created lazily on first use) to keep the
+    // Unicorn handles thread-local.
+    let task_results: Vec<(u64, Option<u64>, std::result::Result<RunResult, String>)> = tasks
+        .par_iter()
+        .map_init(
+            || EmulationDriver::new(input, parsed),
+            |driver_res, task| {
+                let driver = match driver_res {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return match task {
+                            CallsiteTask::Direct { callee, .. } => {
+                                (*callee, None, Err(e.to_string()))
+                            }
+                            CallsiteTask::Prefill {
+                                callee, source_va, ..
+                            } => (*callee, Some(*source_va), Err(e.to_string())),
+                        };
+                    }
+                };
+                match task {
+                    CallsiteTask::Direct { callee, args } => {
+                        match driver.run_function_with(*callee, callsite_step_cap, &[*args]) {
+                            Ok(r) => (*callee, None, Ok(r)),
+                            Err(e) => (*callee, None, Err(e.to_string())),
+                        }
+                    }
+                    CallsiteTask::Prefill {
+                        callee,
+                        args,
+                        prefill,
+                        source_va,
+                    } => {
+                        match driver.run_function_with_prefill(
+                            *callee,
+                            callsite_step_cap,
+                            args,
+                            prefill,
+                        ) {
+                            Ok(r) => (*callee, Some(*source_va), Ok(r)),
+                            Err(e) => (*callee, Some(*source_va), Err(e.to_string())),
+                        }
+                    }
+                }
+            },
+        )
+        .collect();
+
+    for (callee, source_va, run) in task_results {
+        match run {
+            Ok(r) => {
+                let prev_decoded = out.decoded.len();
+                let prev_stack = out.stack.len();
+                push_recovered(r, callee, source_va, out, &mut driver_errors);
+                if out.decoded.len() > prev_decoded || out.stack.len() > prev_stack {
+                    sites_yielded += 1;
+                }
+            }
+            Err(_) => driver_errors += 1,
         }
     }
     log::debug!(
@@ -824,12 +910,14 @@ fn run_aarch64_emulation<'a>(
     use std::borrow::Cow;
     use strix_core::Location;
 
+    use rayon::prelude::*;
+
     use crate::aarch64::AArch64Analyzer;
     use crate::aarch64_callsite::{
         find_call_sites_aarch64, resolve_call_site_regs_aarch64,
         resolve_call_site_regs_aarch64_cross_block,
     };
-    use crate::driver::{EmulationDriver, RecoveredKind};
+    use crate::driver::{EmulationDriver, RecoveredKind, RunResult};
 
     let (want_decoded, want_stack, want_tight) = want;
 
@@ -842,20 +930,15 @@ fn run_aarch64_emulation<'a>(
         return Ok(());
     }
 
-    // 2. Build the driver (maps scratch / heap / stack / stub regions,
-    //    patches import IAT to stub addresses, installs hooks).
-    let mut driver = match EmulationDriver::new(input, parsed) {
-        Ok(d) => d,
-        Err(e) => {
-            out.warnings
-                .push(format!("aarch64 driver construction failed: {e}"));
-            return Ok(());
-        }
-    };
+    // 2. Compute the memory layout once for argset construction.
+    //    Per-worker drivers are built lazily inside the rayon
+    //    `map_init` closures below — Unicorn handles aren't `Send`,
+    //    so each worker owns its own.
+    let layout = crate::driver::MemoryLayout::for_bits(parsed.metadata.bits.unwrap_or(64));
 
     let candidate_vas: Vec<u64> = funcs.keys().copied().take(MAX_CANDIDATES).collect();
     let mut errors: u32 = 0;
-    let mut attempts: u32 = 0;
+    let attempts: u32 = candidate_vas.len() as u32;
 
     let push_recovered = |run: crate::driver::RunResult,
                           fallback_func_va: u64,
@@ -893,24 +976,35 @@ fn run_aarch64_emulation<'a>(
         }
     };
 
-    // 3. Brute-force fuzz every candidate.
-    for entry in &candidate_vas {
-        attempts += 1;
-        match driver.run_function_fuzzed(*entry, options.max_emulation_steps) {
-            Ok(r) => push_recovered(r, *entry, out, &mut errors),
+    // 3. Brute-force fuzz every candidate, fanned out across rayon.
+    let brute_results: Vec<(u64, std::result::Result<RunResult, String>)> = candidate_vas
+        .par_iter()
+        .map_init(
+            || EmulationDriver::new(input, parsed),
+            |driver_res, &entry| match driver_res {
+                Ok(driver) => {
+                    match driver.run_function_fuzzed(entry, options.max_emulation_steps) {
+                        Ok(r) => (entry, Ok(r)),
+                        Err(e) => (entry, Err(e.to_string())),
+                    }
+                }
+                Err(e) => (entry, Err(e.to_string())),
+            },
+        )
+        .collect();
+    for (entry, run) in brute_results {
+        match run {
+            Ok(r) => push_recovered(r, entry, out, &mut errors),
             Err(_) => errors += 1,
         }
     }
 
-    // 4. Call-site dataflow: for each candidate, find BL sites,
-    //    resolve X0..X7 via forward sweep, build a concrete ArgSet,
-    //    and emulate the decoder again with those args. This is what
-    //    recovers decoders whose source pointer is materialized by
-    //    the caller via `adrp + add` pointing at .rodata.
+    // 4. Call-site dataflow: for each candidate, find BL sites and
+    //    resolve X0..X7. Build a task list of (callee, args) pairs,
+    //    then fan the emulation runs out across rayon.
     const MAX_SITES_PER_CANDIDATE: usize = 6;
     let callsite_step_cap = options.max_emulation_steps.saturating_mul(4).max(20_000);
-    let mut sites_run: u32 = 0;
-    let mut sites_errors: u32 = 0;
+    let mut callsite_tasks: Vec<(u64, crate::driver::ArgSet)> = Vec::new();
     for callee in &candidate_vas {
         let sites = find_call_sites_aarch64(&analyzer, &funcs, *callee, MAX_SITES_PER_CANDIDATE);
         for site in sites {
@@ -923,12 +1017,29 @@ fn run_aarch64_emulation<'a>(
             if !any_resolved(&regs) {
                 continue;
             }
-            let args = aarch64_resolved_to_argset(&driver.layout, regs);
-            sites_run += 1;
-            match driver.run_function(*callee, callsite_step_cap, &args) {
-                Ok(r) => push_recovered(r, *callee, out, &mut sites_errors),
-                Err(_) => sites_errors += 1,
-            }
+            let args = aarch64_resolved_to_argset(&layout, regs);
+            callsite_tasks.push((*callee, args));
+        }
+    }
+    let sites_run = callsite_tasks.len() as u32;
+    let mut sites_errors: u32 = 0;
+    let callsite_results: Vec<(u64, std::result::Result<RunResult, String>)> = callsite_tasks
+        .par_iter()
+        .map_init(
+            || EmulationDriver::new(input, parsed),
+            |driver_res, (callee, args)| match driver_res {
+                Ok(driver) => match driver.run_function(*callee, callsite_step_cap, args) {
+                    Ok(r) => (*callee, Ok(r)),
+                    Err(e) => (*callee, Err(e.to_string())),
+                },
+                Err(e) => (*callee, Err(e.to_string())),
+            },
+        )
+        .collect();
+    for (callee, run) in callsite_results {
+        match run {
+            Ok(r) => push_recovered(r, callee, out, &mut sites_errors),
+            Err(_) => sites_errors += 1,
         }
     }
     if sites_run > 0 && sites_errors == sites_run {

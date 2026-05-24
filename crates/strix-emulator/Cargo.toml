@@ -13,6 +13,7 @@ strix-format = { workspace = true }
 iced-x86 = { workspace = true }
 bad64 = { workspace = true }
 log = { workspace = true }
+rayon = { workspace = true }
 
 [features]
 default = []

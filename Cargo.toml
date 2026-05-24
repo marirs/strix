@@ -42,10 +42,13 @@ clap        = { version = "4", features = ["derive"] }
 anyhow      = "1"
 memmap2     = "0.9"
 iced-x86    = "1"
-# Pure-Rust AArch64 disassembler. Optional, gated behind the
-# `aarch64` feature in strix-emulator so x86-only builds don't
-# pull it in.
+# Pure-Rust AArch64 disassembler. Always-on in strix-emulator.
 bad64       = "0.12"
+# Work-stealing thread pool used by the emulation pipeline to fan
+# the brute-force fuzz + caller emulation + call-site dataflow
+# loops out across cores. Users can constrain the pool size via
+# the standard `RAYON_NUM_THREADS` env var.
+rayon       = "1"
 
 [profile.release]
 opt-level = 3
