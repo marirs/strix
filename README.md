@@ -283,11 +283,35 @@ let result = strix::extract(&bytes, &strix::ExtractOptions::default())?;
 | Kind          | Source                                                    |
 |---------------|-----------------------------------------------------------|
 | `static_ascii` / `static_utf16_le` | Printable byte runs in any section. |
-| `go`          | UTF-8 strings from Go binaries (initial impl).           |
-| `rust`        | UTF-8 strings from Rust binaries (initial impl).         |
-| `stack`       | Strings built on the stack via mov/push/reg-then-store patterns. |
-| `decoded`     | Strings produced by in-memory decoder routines, recovered via Unicorn-backed brute-force emulation with import stubs and call-site argument extraction. |
-| `tight`       | Currently lumped into `stack`. Future: distinguished by loop correlation. |
+| `go`          | UTF-8 strings from Go binaries (function names from pclntab when present). |
+| `rust`        | UTF-8 strings from Rust binaries (crate metadata from `.rustc` when present). |
+| `stack`       | Strings built on the stack via mov / push / reg-then-store patterns. x86, x86_64, and AArch64. |
+| `decoded`     | Strings produced by in-memory decoder routines, recovered via Unicorn-backed brute-force emulation with import stubs and call-site argument extraction. x86, x86_64, and AArch64. |
+| `tight`       | Stack strings whose writing instruction lies inside a discovered loop body. Distinguished from `stack` via CFG back-edge detection. |
+
+## Performance
+
+The emulation pipeline (brute-force decoder fuzzing, caller emulation,
+and call-site dataflow runs) parallelizes across cores via rayon. Each
+worker thread builds its own Unicorn instance; the per-worker
+construction cost is amortized across all candidates that thread is
+assigned. Set `RAYON_NUM_THREADS=1` for deterministic single-threaded
+runs.
+
+Indicative wall-clock on an Apple Silicon laptop:
+
+```
+$ time target/release/strix tests/fixtures/elf-Linux-ARM64-bash > /dev/null
+real 0m0.265s
+user 0m0.910s
+sys  0m0.138s
+```
+
+The 3.4x ratio of user time to real time on that run shows roughly
+three-and-a-half cores busy in parallel during the emulation pass.
+The speedup scales with the number of decoder candidates the heuristic
+flags above the score threshold; binaries with only a handful of
+candidates see little benefit because rayon overhead dominates.
 
 ## Workspace layout
 
@@ -297,8 +321,9 @@ crates/
   strix-format    PE / ELF / Mach-O / shellcode parsing (goblin)
   strix-static    zero-copy ASCII + UTF-16LE scanning
   strix-lang      Go and Rust language-specific extraction
-  strix-emulator  Unicorn-backed emulator + iced-x86 analyzer
-                  + stack-string pattern matcher
+  strix-emulator  Unicorn-backed emulator + iced-x86 + bad64 analyzers
+                  + x86 and AArch64 stack-string pattern matchers
+                  + x86 and AArch64 call-site dataflow analyzers
   strix           umbrella library, ties everything together
   strix-cli       CLI binary
 ```
