@@ -147,7 +147,7 @@ Add it to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-strix      = { git = "https://github.com/marirs/strix", tag = "v0.1.0", features = ["unicorn"] }
+strix      = { git = "https://github.com/marirs/strix", tag = "v0.1.1", features = ["unicorn"] }
 serde_json = "1"
 ```
 
@@ -160,7 +160,7 @@ need `cmake` or a C toolchain at build time:
 
 ```toml
 [dependencies]
-strix = { git = "https://github.com/marirs/strix", tag = "v0.1.0" }
+strix = { git = "https://github.com/marirs/strix", tag = "v0.1.1" }
 ```
 
 ### Minimal example
@@ -229,7 +229,7 @@ The JSON schema matches the CLI's `--json` output exactly:
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "input": {
     "format": "pe",
     "arch": "x86_64",
