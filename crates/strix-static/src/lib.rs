@@ -126,7 +126,12 @@ fn extract_ascii<'a>(input: &'a [u8], min_len: usize, out: &mut Vec<ExtractedStr
 
 /// Printable Unicode, excluding control codes, replacement characters and BOMs.
 fn printable(ch: char) -> bool {
-    (!ch.is_control() || ch == '\t') && ch != '\u{fffd}' && ch != '\u{feff}'
+    let point = ch as u32;
+    (!ch.is_control() || ch == '\t')
+        && ch != '\u{fffd}'
+        && ch != '\u{feff}'
+        && !(0xfdd0..=0xfdef).contains(&point)
+        && point & 0xffff < 0xfffe
 }
 
 fn extract_utf8<'a>(
@@ -481,6 +486,24 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+    #[test]
+    fn unicode_noncharacters_split_runs() {
+        for point in [0xfffe, 0xffff, 0xfdd0, 0xfdef, 0x1fffe, 0x10ffff] {
+            let separator = char::from_u32(point).unwrap();
+            let text = format!("{separator}hello");
+            let result = extract(
+                text.as_bytes(),
+                &ExtractOptions {
+                    enabled: Some(vec![StringKind::StaticUtf8]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].value, "hello");
+            assert_eq!(result[0].location.offset, separator.len_utf8() as u64);
         }
     }
 }

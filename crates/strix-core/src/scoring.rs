@@ -13,7 +13,7 @@ pub struct TrigramModel {
 }
 impl TrigramModel {
     /// Parse model rows (`character TAB character TAB character TAB count`).
-    /// Supports ASCII, [SP], [HT], [^] and [$]. No model is downloaded implicitly.
+    /// Supports ASCII, `[SP]`, `[HT]`, `[^]` and `[$]`. No model is downloaded implicitly.
     pub fn from_sng(text: &str) -> Result<Self> {
         let mut counts = HashMap::<[u8; 3], f64>::new();
         let mut lowercase = false;
