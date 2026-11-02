@@ -7,6 +7,36 @@ Semantic Versioning where the 0.x line is concerned (breaking changes
 are flagged in the notes but are still possible between minor versions
 until 1.0).
 
+## 0.2.0
+
+### Added
+
+* Borrowed general UTF-8 extraction and owned full-Unicode UTF-16LE/BE decoding,
+  including surrogate pairs, odd offsets, malformed-input regression tests and
+  character-based minimum lengths. Explicit static encoding selection in CLI.
+* Opt-in, bounded single-layer Base64 recovery with original/decoded byte-offset
+  provenance. Direct static payloads remain borrowed.
+* Opt-in semantic/context tagging and any-tag filtering, inspired by FLOSS.
+* Optional shared .sng trigram models and allocation-free per-string scoring.
+  Model thresholds do not silently remove Unicode or rewrite extracted text.
+* Streaming JSONL output for individual string records.
+* Ownership/pointer, serialization, tag, filter and decoder-bound regression tests.
+
+### Changed
+
+* All workspace crates move to 0.2.0; minimum Rust stays 1.95.
+* Default static coverage now includes UTF-8 and both UTF-16 byte orders.
+  Exhaustive enum matches and complete option/result literals need updating.
+* Empty analysis metadata is omitted from JSON; old JSON remains readable.
+* Deduplication hashes borrowed text instead of copying each payload.
+
+### Fixed
+
+* UTF-16BE ASCII is no longer emitted solely as a one-byte-shifted, truncated
+  UTF-16LE candidate when the full opposite-endian candidate is present.
+* README now distinguishes borrowed payloads from owned transcoding/recovery
+  and documents the native bad64-sys build dependency.
+
 ## 0.1.1
 
 ### Added

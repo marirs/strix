@@ -10,3 +10,5 @@ rust-version.workspace = true
 [dependencies]
 strix-core = { workspace = true }
 memchr = { workspace = true }
+
+base64 = "0.22"

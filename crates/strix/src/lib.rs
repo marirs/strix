@@ -16,8 +16,9 @@
 //!
 //! ## Zero-copy
 //!
-//! Strings recovered from the input directly (static, Go, Rust) are
+//! ASCII/UTF-8 strings recovered directly (static, Go, Rust) are
 //! returned as `Cow::Borrowed(&str)` slices into the input buffer.
+//! UTF-16 and Base64 results own decoded UTF-8 text.
 //! Strings synthesized via CPU emulation (decoded/stack/tight) own
 //! their bytes — those bytes don't exist in the file until emulation
 //! produces them, so zero-copy is not possible there. If you need
@@ -28,16 +29,18 @@
 //!
 //! | Extractor | Available |
 //! |---|---|
-//! | static (ASCII + UTF-16LE) | always |
+//! | static (ASCII, UTF-8, UTF-16LE/BE) | always |
+//! | Base64 text recovery | opt-in through options |
 //! | Go / Rust language strings | always |
-//! | decoded / stack / tight | with `unicorn` feature, port in progress |
+//! | stack / tight patterns | always |
+//! | emulated decoder output | with `unicorn` feature |
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
 pub use strix_core::{
     Encoding, Error, ExtractOptions, ExtractedString, ExtractionResult, FormatHint, InputMetadata,
-    Location, Result, StringKind,
+    Location, Result, StringKind, StringTag, TrigramModel,
 };
 pub use strix_format::{ParsedInput, Section};
 
@@ -62,6 +65,18 @@ pub fn dump_decoder(input: &[u8], options: &ExtractOptions, va: u64) -> Result<V
 /// that lives at least as long as the result, or call
 /// [`ExtractionResult::into_owned`].
 pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<ExtractionResult<'a>> {
+    if !options.min_quality.is_finite() || !(0.0..=1.0).contains(&options.min_quality) {
+        return Err(Error::Other(
+            "min_quality must be finite and in 0..=1".into(),
+        ));
+    }
+    if options.min_trigram_score.is_some_and(|v| !v.is_finite())
+        || (options.min_trigram_score.is_some() && options.trigram_model.is_none())
+    {
+        return Err(Error::Other(
+            "a finite minimum trigram score requires a model".into(),
+        ));
+    }
     // 1. Parse the input file (or treat as shellcode). For fat
     //    Mach-O `parse_all` returns one ParsedInput per arch so we
     //    can run the extraction pipeline against each slice.
@@ -127,6 +142,43 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
         extract_one(input, options, parsed, is_fat, &mut result)?;
     }
 
+    // Decoded bodies necessarily own their output; direct strings remain borrowed.
+    if options.decode_base64 && options.is_enabled(StringKind::Base64) {
+        result
+            .strings
+            .extend(strix_static::extract_base64(input, options));
+    }
+    if options.annotate || !options.required_tags.is_empty() || options.trigram_model.is_some() {
+        let mut seen = std::collections::HashSet::new();
+        for string in &mut result.strings {
+            if options.annotate || !options.required_tags.is_empty() {
+                string
+                    .analysis
+                    .tags
+                    .extend(strix_core::analysis::tags_for(string));
+                if !seen.insert(string.value.as_ref()) {
+                    string.analysis.tags.push(strix_core::StringTag::Duplicate);
+                }
+            }
+            if let Some(model) = &options.trigram_model {
+                string.analysis.trigram_score = model.score(&string.value);
+            }
+        }
+    }
+    if !options.required_tags.is_empty() {
+        result.strings.retain(|s| {
+            options
+                .required_tags
+                .iter()
+                .any(|t| s.analysis.tags.contains(t))
+        });
+    }
+    if let Some(min) = options.min_trigram_score {
+        result
+            .strings
+            .retain(|s| s.analysis.trigram_score.is_none_or(|score| score >= min));
+    }
+
     // Optional quality filter: drop strings whose content-based
     // score falls below the user's threshold. Applied uniformly
     // across all extractors since quality is purely a function of
@@ -150,11 +202,15 @@ pub fn extract<'a>(input: &'a [u8], options: &ExtractOptions) -> Result<Extracti
     // that "the same string in ASCII and UTF-16LE" or "the same string
     // recovered as both Decoded and Stack" remain distinct entries.
     if options.dedupe {
-        use std::collections::HashSet;
-        let mut seen: HashSet<(String, StringKind, Encoding)> = HashSet::new();
-        result
+        let mut seen = std::collections::HashSet::new();
+        let keep: Vec<bool> = result
             .strings
-            .retain(|s| seen.insert((s.value.to_string(), s.kind, s.encoding)));
+            .iter()
+            .map(|s| seen.insert((s.value.as_ref(), s.kind, s.encoding)))
+            .collect();
+        drop(seen);
+        let mut flags = keep.into_iter();
+        result.strings.retain(|_| flags.next().unwrap_or(false));
     }
 
     Ok(result)
@@ -186,8 +242,15 @@ fn extract_one<'a>(
         }
     };
 
-    // 2. Static strings (always-on, zero-copy).
-    if options.is_enabled(StringKind::StaticAscii) || options.is_enabled(StringKind::StaticUtf16Le)
+    // 2. Static strings (ASCII/UTF-8 borrowed; UTF-16 owned).
+    if [
+        StringKind::StaticAscii,
+        StringKind::StaticUtf16Le,
+        StringKind::StaticUtf8,
+        StringKind::StaticUtf16Be,
+    ]
+    .iter()
+    .any(|k| options.is_enabled(*k))
     {
         let (scan_start, scan_view) = match parsed.scan_window {
             Some((start, end)) => {
@@ -204,6 +267,9 @@ fn extract_one<'a>(
                 .section_at(s.location.offset)
                 .map(|sec| sec.executable)
                 .unwrap_or(false);
+            if in_code && (options.annotate || !options.required_tags.is_empty()) {
+                s.analysis.tags.push(strix_core::StringTag::Code);
+            }
             if options.skip_code_sections && in_code {
                 continue;
             }
@@ -264,7 +330,7 @@ fn extract_one<'a>(
         use std::collections::HashSet;
         let mut targets: HashSet<u64> = HashSet::new();
         for s in &result.strings {
-            if matches!(s.kind, StringKind::StaticAscii | StringKind::StaticUtf16Le)
+            if s.kind.is_static()
                 && let Some(va) = s.location.address
             {
                 targets.insert(va);
@@ -274,7 +340,7 @@ fn extract_one<'a>(
             let analyzer = strix_emulator::analyzer::CodeAnalyzer::new(input, parsed);
             let counts = analyzer.count_rip_xrefs(&targets);
             for s in &mut result.strings {
-                if !matches!(s.kind, StringKind::StaticAscii | StringKind::StaticUtf16Le) {
+                if !s.kind.is_static() {
                     continue;
                 }
                 if let Some(va) = s.location.address

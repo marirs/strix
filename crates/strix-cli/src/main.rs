@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use memmap2::Mmap;
-use strix::{ExtractOptions, ExtractedString, ExtractionResult, FormatHint, StringKind};
+use strix::{
+    ExtractOptions, ExtractedString, ExtractionResult, FormatHint, StringKind, StringTag,
+    TrigramModel,
+};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 #[allow(non_camel_case_types)]
@@ -57,16 +60,41 @@ enum KindArg {
     stack,
     tight,
     decoded,
+    base64,
 }
 
 impl KindArg {
     fn expand(self) -> &'static [StringKind] {
         match self {
-            KindArg::r#static => &[StringKind::StaticAscii, StringKind::StaticUtf16Le],
+            KindArg::r#static => &[
+                StringKind::StaticAscii,
+                StringKind::StaticUtf16Le,
+                StringKind::StaticUtf8,
+                StringKind::StaticUtf16Be,
+            ],
+            KindArg::base64 => &[StringKind::Base64],
             KindArg::lang => &[StringKind::Go, StringKind::Rust],
             KindArg::stack => &[StringKind::Stack],
             KindArg::tight => &[StringKind::Tight],
             KindArg::decoded => &[StringKind::Decoded],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum EncodingArg {
+    Ascii,
+    Utf8,
+    Utf16le,
+    Utf16be,
+}
+impl EncodingArg {
+    fn kind(self) -> StringKind {
+        match self {
+            Self::Ascii => StringKind::StaticAscii,
+            Self::Utf8 => StringKind::StaticUtf8,
+            Self::Utf16le => StringKind::StaticUtf16Le,
+            Self::Utf16be => StringKind::StaticUtf16Be,
         }
     }
 }
@@ -93,6 +121,11 @@ struct Cli {
     /// Skip the listed extractor groups.
     #[arg(long, value_enum, num_args = 1.., value_delimiter = ',')]
     no: Vec<KindArg>,
+
+    /// Select static encodings (default: ASCII, UTF-8, UTF-16LE/BE).
+    /// Explicit selection is useful when raw UTF-16 endian interpretations overlap.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    encoding: Vec<EncodingArg>,
 
     /// Override format auto-detection.
     #[arg(long, value_enum, default_value_t = FormatArg::auto)]
@@ -149,6 +182,31 @@ struct Cli {
     #[arg(long)]
     by_function: bool,
 
+    /// Recover text from bounded Base64 tokens (owned decoded results).
+    #[arg(long)]
+    decode_base64: bool,
+
+    /// Add non-destructive semantic and binary-layout tags.
+    #[arg(long)]
+    annotate: bool,
+
+    /// Keep strings matching any tag (url, ip_address, email, path, registry,
+    /// library, code, duplicate, base64). Implies annotation.
+    #[arg(long, value_delimiter = ',', value_parser = parse_tag)]
+    tag: Vec<StringTag>,
+
+    /// Load an optional .sng trigram count model; no implicit model download.
+    #[arg(long)]
+    model: Option<PathBuf>,
+
+    /// Minimum average model log10 probability. Unscored Unicode is retained.
+    #[arg(long, requires = "model", allow_negative_numbers = true)]
+    min_trigram_score: Option<f64>,
+
+    /// Emit one string record per line without building an output buffer.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
+
     /// Briefer human-readable output: show only the emulation-
     /// recovered sections (decoded / stack / tight) and the
     /// decoder-candidate summary, suppressing static and language
@@ -175,6 +233,10 @@ struct Cli {
     dump_decoder: Option<u64>,
 }
 
+fn parse_tag(s: &str) -> std::result::Result<StringTag, String> {
+    StringTag::parse(s).ok_or_else(|| format!("unknown string tag: {s}"))
+}
+
 fn parse_va(s: &str) -> std::result::Result<u64, String> {
     let s = s.trim();
     let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
@@ -191,37 +253,53 @@ fn main() -> Result<()> {
     // mmap the input for zero-copy extraction.
     let file = std::fs::File::open(&cli.input)
         .with_context(|| format!("opening {}", cli.input.display()))?;
-    // SAFETY: We don't mutate the file or expose the mmap as &mut.
-    let mmap =
-        unsafe { Mmap::map(&file) }.with_context(|| format!("mmap'ing {}", cli.input.display()))?;
-    let bytes: &[u8] = &mmap;
+    let mmap = if file.metadata()?.len() == 0 {
+        None
+    } else {
+        // SAFETY: We don't mutate the file or expose the mmap as &mut.
+        Some(
+            unsafe { Mmap::map(&file) }
+                .with_context(|| format!("mmap'ing {}", cli.input.display()))?,
+        )
+    };
+    let bytes: &[u8] = mmap.as_deref().unwrap_or(&[]);
 
     let all: &[StringKind] = &[
         StringKind::StaticAscii,
         StringKind::StaticUtf16Le,
+        StringKind::StaticUtf8,
+        StringKind::StaticUtf16Be,
+        StringKind::Base64,
         StringKind::Go,
         StringKind::Rust,
         StringKind::Stack,
         StringKind::Tight,
         StringKind::Decoded,
     ];
-    let enabled: Option<Vec<StringKind>> = if cli.only.is_empty() && cli.no.is_empty() {
-        None
-    } else {
-        let mut set: Vec<StringKind> = if cli.only.is_empty() {
-            all.to_vec()
+    let enabled: Option<Vec<StringKind>> =
+        if cli.only.is_empty() && cli.no.is_empty() && cli.encoding.is_empty() {
+            None
         } else {
-            cli.only
-                .iter()
-                .flat_map(|k| k.expand().iter().copied())
-                .collect()
+            let mut set: Vec<StringKind> = if cli.only.is_empty() {
+                all.to_vec()
+            } else {
+                cli.only
+                    .iter()
+                    .flat_map(|k| k.expand().iter().copied())
+                    .collect()
+            };
+            for k in &cli.no {
+                let drop: &[StringKind] = k.expand();
+                set.retain(|x| !drop.contains(x));
+            }
+            if !cli.encoding.is_empty() {
+                set.retain(|kind| {
+                    !kind.is_static()
+                        || cli.encoding.iter().any(|encoding| encoding.kind() == *kind)
+                });
+            }
+            Some(set)
         };
-        for k in &cli.no {
-            let drop: &[StringKind] = k.expand();
-            set.retain(|x| !drop.contains(x));
-        }
-        Some(set)
-    };
 
     let options = ExtractOptions {
         min_length: cli.min_length,
@@ -232,6 +310,19 @@ fn main() -> Result<()> {
         skip_code_sections: cli.no_code,
         skip_library_strings: cli.no_library,
         min_quality: cli.min_quality,
+        decode_base64: cli.decode_base64 || cli.only.contains(&KindArg::base64),
+        annotate: cli.annotate,
+        required_tags: cli.tag.clone(),
+        trigram_model: cli
+            .model
+            .as_ref()
+            .map(|path| -> Result<_> {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading model {}", path.display()))?;
+                Ok(std::sync::Arc::new(TrigramModel::from_sng(&text)?))
+            })
+            .transpose()?,
+        min_trigram_score: cli.min_trigram_score,
     };
 
     // --dump-decoder short-circuits the normal extraction.
@@ -306,7 +397,12 @@ fn main() -> Result<()> {
     };
     let mut out = sink;
 
-    if cli.json {
+    if cli.jsonl {
+        for string in &result.strings {
+            serde_json::to_writer(&mut out, string)?;
+            writeln!(out)?;
+        }
+    } else if cli.json {
         if cli.pretty {
             serde_json::to_writer_pretty(&mut out, &result)?;
         } else {
@@ -341,8 +437,14 @@ fn print_human(
     let order = [
         (
             "static strings",
-            &[StringKind::StaticAscii, StringKind::StaticUtf16Le][..],
+            &[
+                StringKind::StaticAscii,
+                StringKind::StaticUtf16Le,
+                StringKind::StaticUtf8,
+                StringKind::StaticUtf16Be,
+            ][..],
         ),
+        ("base64 strings", &[StringKind::Base64][..]),
         ("language strings", &[StringKind::Go, StringKind::Rust][..]),
         ("decoded strings", &[StringKind::Decoded][..]),
         ("stack strings", &[StringKind::Stack][..]),
@@ -461,13 +563,13 @@ fn print_human(
                     items.len()
                 )?;
                 for s in items {
-                    writeln!(out, "    {}", s.value)?;
+                    writeln!(out, "    {}{}", s.value, annotation_suffix(s))?;
                 }
             }
         } else {
             for s in combined {
                 let addr = s.location.address.unwrap_or(s.location.offset);
-                writeln!(out, "{:#018x}  {}", addr, s.value)?;
+                writeln!(out, "{:#018x}  {}{}", addr, s.value, annotation_suffix(s))?;
             }
         }
         if !quiet {
@@ -492,6 +594,21 @@ fn group_strings<'a, 'b>(
     let mut out: BTreeMap<StringKind, Vec<&'b ExtractedString<'a>>> = BTreeMap::new();
     for s in strings {
         out.entry(s.kind).or_default().push(s);
+    }
+    out
+}
+
+fn annotation_suffix(string: &ExtractedString<'_>) -> String {
+    let mut out = String::new();
+    if let Some(score) = string.analysis.trigram_score {
+        out.push_str(&format!("  [score={score:.3}]"));
+    }
+    for tag in &string.analysis.tags {
+        out.push_str(" #");
+        out.push_str(tag.name());
+    }
+    if let Some(offset) = string.analysis.decoded_offset {
+        out.push_str(&format!(" [decoded+{offset:#x}]"));
     }
     out
 }

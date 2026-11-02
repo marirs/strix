@@ -175,6 +175,7 @@ pub(crate) fn extract_utf8_runs<'a>(
             };
             let offset = (start + run_start) as u64;
             out.push(ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Borrowed(s),
                 kind,
                 encoding: Encoding::Utf8,

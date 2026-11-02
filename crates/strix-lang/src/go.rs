@@ -158,6 +158,7 @@ fn extract_pclntab_names<'a>(
                     std::str::from_utf8_unchecked(&input[abs_offset..abs_offset + raw.len()])
                 };
                 out.push(ExtractedString {
+                    analysis: Default::default(),
                     value: Cow::Borrowed(s),
                     kind: StringKind::Go,
                     encoding: Encoding::Utf8,

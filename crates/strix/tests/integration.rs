@@ -21,6 +21,7 @@ fn extracts_ascii_strings_from_raw_bytes() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -42,6 +43,7 @@ fn ascii_strings_borrow_from_input() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.strings.len(), 1);
@@ -63,6 +65,7 @@ fn json_round_trip_is_lossless() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(buf, &opts).expect("extract");
     let json = serde_json::to_string(&result).expect("to_string");
@@ -91,6 +94,7 @@ fn emulation_extractors_do_not_fail() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let _result = extract(buf, &opts).expect("emulation extractors must not error");
 }
@@ -107,6 +111,7 @@ fn unknown_format_falls_back_to_raw_with_warning() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(buf, &opts).expect("extract");
     assert_eq!(result.input.format, "unknown");
@@ -133,6 +138,7 @@ fn utf16le_strings_are_extracted() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(&buf, &opts).expect("extract");
     let values: Vec<&str> = result.strings.iter().map(|s| s.value.as_ref()).collect();
@@ -154,6 +160,7 @@ fn dedupe_drops_repeats() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let opts_drop = ExtractOptions {
         dedupe: true,
@@ -192,6 +199,7 @@ fn skip_code_sections_filters_executable_section_strings() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let opts_drop = ExtractOptions {
         skip_code_sections: true,
@@ -228,6 +236,7 @@ fn skip_library_strings_filters_curated_set() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let opts_drop = ExtractOptions {
         skip_library_strings: true,
@@ -269,6 +278,7 @@ fn min_quality_filters_low_entropy_noise() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let opts_drop = ExtractOptions {
         min_quality: 0.4,
@@ -308,6 +318,7 @@ fn empty_input_returns_empty_result() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(b"", &opts).expect("extract");
     assert!(result.strings.is_empty());
@@ -360,6 +371,7 @@ fn end_to_end_decoded_extraction_via_public_api() {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     };
     let result = extract(&code, &opts).expect("extract must not error");
 
