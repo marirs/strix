@@ -155,6 +155,7 @@ pub fn extract_emulated<'a>(
                 &mut out.stack
             };
             bucket.push(ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Owned(rec.value),
                 kind,
                 encoding: Encoding::Ascii,
@@ -431,6 +432,7 @@ fn run_emulated_pipeline<'a>(
                 RecoveredKind::Stack => (StringKind::Stack, "stack"),
             };
             let extracted = ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Owned(rec.value),
                 kind: final_kind,
                 encoding: rec.encoding,
@@ -858,6 +860,7 @@ fn run_aarch64_pipeline<'a>(
                 &mut out.stack
             };
             bucket.push(ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Owned(rec.value),
                 kind,
                 encoding: Encoding::Ascii,
@@ -956,6 +959,7 @@ fn run_aarch64_emulation<'a>(
                 RecoveredKind::Stack => (StringKind::Stack, "stack"),
             };
             let extracted = ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Owned(rec.value),
                 kind: final_kind,
                 encoding: rec.encoding,

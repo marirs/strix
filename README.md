@@ -12,11 +12,68 @@ strings, with structured JSON output.
 
 ## Zero-copy
 
-Static strings, Go strings, and Rust strings borrow directly from the
-input bytes via `Cow::Borrowed(&str)`. Pass the file in via `mmap` and
-no allocation happens for those extractors. Emulated strings
-(decoded / stack / tight) cannot be zero-copy by definition — they
-don't exist in the file until emulation runs.
+ASCII and valid UTF-8 payloads returned by the static scanner borrow directly
+from the input (`Cow::Borrowed(&str)`). Go/Rust extraction also borrows when the
+text exists directly in the input. The CLI reads through an mmap. Filtering,
+tagging, scoring and deduplication do not copy or rewrite these payloads.
+Result vectors, metadata, model loading and output formatting still allocate.
+
+UTF-16LE/BE must be transcoded into UTF-8, so those results are `Cow::Owned`.
+Base64 and emulation results also own their text because the decoded bytes do
+not exist as a contiguous UTF-8 slice in the original input. `into_owned()` is
+available when the caller deliberately wants to release the input buffer.
+
+## Version 0.2: Unicode, optional scoring and context tags
+
+* General UTF-8 static extraction, including multilingual text, with borrowed
+  payloads and original byte offsets.
+* Full UTF-16LE/BE decoding, including surrogate pairs and odd offsets. Invalid
+  code units split strings instead of inserting replacement characters.
+* `--encoding ascii,utf8,utf16le,utf16be` selects static encodings. Raw UTF-16 can
+  have multiple plausible endian/alignment interpretations; select the known
+  encoding when appropriate. Unicode is preserved without a language model.
+* `--decode-base64` (or `--only base64`) enables standard/URL-safe, padded or
+  unpadded token recovery. It is single-layer, limited to 1 MiB per encoded token
+  and 16 MiB decoded bytes per input. Wrapped/whitespace-separated containers
+  are not joined. `location.offset` identifies the original encoded token;
+  `analysis.decoded_offset` identifies text inside its decoded body, and
+  `analysis.source_length` records the encoded source length.
+* `--annotate` adds non-destructive URL, IP, email, path, registry, library,
+  executable-section, duplicate and Base64 tags. `--tag url,registry` keeps
+  matches for any selected tag. These are candidate indicators, not verdicts.
+  No embedded global-prevalence/OSS/capa database is claimed or downloaded.
+* `--model PATH.sng` loads an optional ASCII trigram count model once. Scoring
+  reads borrowed text without copying it. `--min-trigram-score -5` optionally
+  filters by the mean smoothed log10 probability. These are **not Ghidra's
+  calibrated scores/acceptance thresholds**. Unicode and strings shorter than
+  three characters remain unscored and are retained by this filter. Original
+  text is never transliterated or normalized in the output. No model is bundled
+  or fetched implicitly; the model is opt-in for both CLI and library callers.
+* `--jsonl` writes one string record per line, including optional annotations.
+
+```bash
+strix --only static --encoding ascii,utf8 --annotate sample.bin
+strix --decode-base64 --annotate --tag url,registry --jsonl sample.exe
+strix --only static --encoding ascii --model custom.sng --min-trigram-score -5 sample.bin
+```
+
+Inspired by the multi-encoding, Base64 and optional text-scoring ideas in
+[Stranger Strings](https://github.com/closed-systems/stranger-strings), and the
+non-destructive layout/tagging approach in
+[FLOSS](https://github.com/mandiant/flare-floss). Strix retains its own scanners,
+borrowed result types and emulation pipeline; it does not embed either tool or
+their tag/model datasets.
+
+### Migration from 0.1
+
+All workspace packages are now 0.2.0. `Encoding` and `StringKind` have new
+variants; update exhaustive matches. `ExtractOptions` has new opt-in fields;
+prefer `..Default::default()` in struct literals. `ExtractedString` carries a
+serde-defaulted `analysis` field, omitted from JSON when empty. Older JSON still
+loads. Default static extraction now includes UTF-8 and both UTF-16 byte orders,
+so it can return additional Unicode candidates. Select only the old static kinds
+for legacy coverage. Base64, annotations and model scoring remain disabled by
+default.
 
 ## Install
 
@@ -147,7 +204,7 @@ Add it to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-strix      = { git = "https://github.com/marirs/strix", tag = "v0.1.1", features = ["unicorn"] }
+strix      = { git = "https://github.com/marirs/strix", branch = "master", features = ["unicorn"] }
 serde_json = "1"
 ```
 
@@ -160,7 +217,7 @@ need `cmake` or a C toolchain at build time:
 
 ```toml
 [dependencies]
-strix = { git = "https://github.com/marirs/strix", tag = "v0.1.1" }
+strix = { git = "https://github.com/marirs/strix", branch = "master" }
 ```
 
 ### Minimal example
@@ -229,7 +286,7 @@ The JSON schema matches the CLI's `--json` output exactly:
 
 ```json
 {
-  "version": "0.1.1",
+  "version": "0.2.0",
   "input": {
     "format": "pe",
     "arch": "x86_64",
@@ -319,7 +376,7 @@ candidates see little benefit because rayon overhead dominates.
 crates/
   strix-core      types, JSON schema, errors, traits
   strix-format    PE / ELF / Mach-O / shellcode parsing (goblin)
-  strix-static    zero-copy ASCII + UTF-16LE scanning
+  strix-static    borrowed ASCII/UTF-8, owned UTF-16LE/BE and optional Base64
   strix-lang      Go and Rust language-specific extraction
   strix-emulator  Unicorn-backed emulator + iced-x86 + bad64 analyzers
                   + x86 and AArch64 stack-string pattern matchers

@@ -49,6 +49,7 @@ fn opts_all() -> ExtractOptions {
         skip_code_sections: false,
         skip_library_strings: false,
         min_quality: 0.0,
+        ..Default::default()
     }
 }
 

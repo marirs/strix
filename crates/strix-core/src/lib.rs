@@ -13,10 +13,14 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+pub mod analysis;
 pub mod capability;
 pub mod error;
 pub mod library;
 pub mod quality;
+pub mod scoring;
+pub use analysis::{StringAnalysis, StringTag};
+pub use scoring::TrigramModel;
 pub mod traits;
 
 pub use capability::tags_for_imports;
@@ -36,6 +40,12 @@ pub enum StringKind {
     StaticAscii,
     /// UTF-16 little-endian printable run.
     StaticUtf16Le,
+    /// General printable UTF-8 run containing non-ASCII characters.
+    StaticUtf8,
+    /// UTF-16 big-endian printable run.
+    StaticUtf16Be,
+    /// Text recovered from an embedded Base64 block.
+    Base64,
     /// String pulled from a Go runtime string table.
     Go,
     /// String pulled from a Rust binary's `.rodata`.
@@ -49,10 +59,22 @@ pub enum StringKind {
 }
 
 impl StringKind {
+    /// Whether this kind is a direct static scan.
+    pub fn is_static(self) -> bool {
+        matches!(
+            self,
+            Self::StaticAscii | Self::StaticUtf16Le | Self::StaticUtf8 | Self::StaticUtf16Be
+        )
+    }
+
     /// The short tag used in CLI flags (`--only static lang stack ...`).
     pub fn cli_tag(self) -> &'static str {
         match self {
-            StringKind::StaticAscii | StringKind::StaticUtf16Le => "static",
+            StringKind::StaticAscii
+            | StringKind::StaticUtf16Le
+            | StringKind::StaticUtf8
+            | StringKind::StaticUtf16Be => "static",
+            StringKind::Base64 => "base64",
             StringKind::Go | StringKind::Rust => "lang",
             StringKind::Stack => "stack",
             StringKind::Tight => "tight",
@@ -69,6 +91,8 @@ pub enum Encoding {
     Ascii,
     /// UTF-16 little-endian.
     Utf16Le,
+    /// UTF-16 big-endian.
+    Utf16Be,
     /// UTF-8 (used for Go/Rust strings).
     Utf8,
 }
@@ -149,12 +173,16 @@ pub struct ExtractedString<'a> {
     pub encoding: Encoding,
     /// Where the string came from.
     pub location: Location,
+    /// Optional scores, semantic tags and decoded-body provenance.
+    #[serde(default, skip_serializing_if = "StringAnalysis::is_empty")]
+    pub analysis: StringAnalysis,
 }
 
 impl<'a> ExtractedString<'a> {
     /// Convenience constructor for a borrowed string at a file offset.
     pub fn borrowed(value: &'a str, kind: StringKind, encoding: Encoding, offset: u64) -> Self {
         Self {
+            analysis: Default::default(),
             value: Cow::Borrowed(value),
             kind,
             encoding,
@@ -165,6 +193,7 @@ impl<'a> ExtractedString<'a> {
     /// Take ownership of the inner string, breaking the borrow.
     pub fn into_owned(self) -> ExtractedString<'static> {
         ExtractedString {
+            analysis: self.analysis,
             value: Cow::Owned(self.value.into_owned()),
             kind: self.kind,
             encoding: self.encoding,
@@ -211,6 +240,16 @@ pub struct ExtractOptions {
     /// cuts single-character runs (`AAAAAA`, `//////`) and other
     /// low-entropy noise without losing real text.
     pub min_quality: f64,
+    /// Scan bounded Base64 blocks; disabled by default.
+    pub decode_base64: bool,
+    /// Add non-destructive semantic/context tags; disabled by default.
+    pub annotate: bool,
+    /// Keep strings having any of these tags. Empty means no tag filter.
+    pub required_tags: Vec<StringTag>,
+    /// Optional shared model. Scoring reads the borrowed text without copying it.
+    pub trigram_model: Option<std::sync::Arc<TrigramModel>>,
+    /// Optional average log10 probability cutoff. Unscored Unicode is retained.
+    pub min_trigram_score: Option<f64>,
 }
 
 impl Default for ExtractOptions {
@@ -224,6 +263,11 @@ impl Default for ExtractOptions {
             skip_code_sections: false,
             skip_library_strings: false,
             min_quality: 0.0,
+            decode_base64: false,
+            annotate: false,
+            required_tags: Vec::new(),
+            trigram_model: None,
+            min_trigram_score: None,
         }
     }
 }

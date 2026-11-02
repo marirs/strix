@@ -70,6 +70,7 @@ pub(crate) fn extract<'a>(
     for (&va, name) in &parsed.symbols {
         if is_rust_mangled(name) && name.len() >= options.min_length {
             out.push(ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Owned(name.clone()),
                 kind: StringKind::Rust,
                 encoding: Encoding::Utf8,
@@ -122,6 +123,7 @@ fn extract_rustc_metadata<'a>(
             let borrowed: &'a str =
                 unsafe { std::str::from_utf8_unchecked(&input[abs..abs + s.len()]) };
             out.push(ExtractedString {
+                analysis: Default::default(),
                 value: Cow::Borrowed(borrowed),
                 kind: StringKind::Rust,
                 encoding: Encoding::Utf8,
@@ -223,6 +225,7 @@ fn extract_rustc_crate_names<'a>(
             if emitted.insert(s) {
                 let abs_offset = start + run_start;
                 out.push(ExtractedString {
+                    analysis: Default::default(),
                     value: Cow::Borrowed(s),
                     kind: StringKind::Rust,
                     encoding: Encoding::Utf8,

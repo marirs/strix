@@ -106,3 +106,16 @@ jobs:
       - name: Install cmake
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config
       - run: cargo doc --workspace --no-deps --features unicorn
+
+  msrv:
+    name: Rust 1.95 minimum
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-1.95
+      - run: cargo check --workspace --all-targets
